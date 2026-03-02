@@ -1,196 +1,223 @@
 #!/usr/bin/env python
 # coding: utf-8
 import argparse
-import copy
-import ctypes
-import itertools
 import json
 import logging
 import math
 import os
 import pickle
-import shutil
-import uuid
-import warnings
 from argparse import Namespace
-from collections import defaultdict
 from datetime import datetime
-from os.path import exists
 from pprint import pformat
 
 import kge
 import numpy as np
 import scipy
 import torch
-from torch import multiprocessing as mp
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-
-warnings.filterwarnings("ignore")
-torch.multiprocessing.set_sharing_strategy("file_system")
 
 
-def save(obj, folder, name=None, override=False):
-    if name is None:
-        name = uuid.uuid4()
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    path_to_file = f"{folder}/{name}.p"
-    if exists(path_to_file):
-        print(f"Warning name {name} exists in cache, do you want to overwrite y/n?")
-        confirm = input() if not override else "y"
-        if confirm != "y":
-            return None
-
-    pickle.dump(obj, open(path_to_file, "wb"))
-    return name
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-def load(folder, name):
-    path_to_file = f"{folder}/{name}.p"
-    if exists(path_to_file):
-        return pickle.load(open(f"{folder}/{name}.p", "rb"))
-    else:
-        print("No such name in cache")
+def get_parser():
+    parser = argparse.ArgumentParser(description="Single relation trainer/evaluator for rule aggregator")
+    parser.add_argument("-c", "--config", default=None, help="Optional config JSON")
+    parser.add_argument("-d", "--dataset", default="codex-m", help="kge dataset name")
+    parser.add_argument("-dev", "--device", default="cuda", help="cpu/cuda")
+    parser.add_argument("--relation", type=int, required=True, help="Relation id to train/evaluate")
+    parser.add_argument("--model", default="LinearAggregator", choices=["LinearAggregator", "NoisyOrAggregator"])
+    parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument("--shuffle_train", action="store_true")
+    parser.add_argument("--max_worker_dataloader", type=int, default=max(os.cpu_count() - 1, 0))
+    parser.add_argument("--lr", type=float,  help="Single learning rate", default=0.01)
+    parser.add_argument("--max_epoch", type=int, help="Single epoch count", default=10)
+    parser.add_argument("--pos", type=float,  help="Single positive weight", default=5)
+    parser.add_argument("--sign_constraint", action="store_true")
+    parser.add_argument("--noisy_or_reg", action="store_true", default=False)
+    parser.add_argument("--num_unseen", type=int, default=0)
+    parser.add_argument("--experiment_root", default=None, help="Base output directory")
+    parser.add_argument("--output_json", default=None, help="Output relation json path")
+    return parser
+
+
+class TensorPairDataset(Dataset):
+    def __init__(self, x, y):
+        self.x = x.long()
+        self.y = y.float()
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+    def __len__(self):
+        return self.x.shape[0]
+
+
+def make_dataset(split_set):
+    x = torch.vstack((split_set.datasets[0].tensors[3], split_set.datasets[1].tensors[3]))
+    y = torch.vstack((split_set.datasets[0].tensors[4], split_set.datasets[1].tensors[4]))
+    return TensorPairDataset(x, y)
+
+
+def build_dataloaders(dataset_dir, relation, batch_size, shuffle_train, workers):
+    path = os.path.join(dataset_dir, f"dataset_{relation}.p")
+    if not os.path.exists(path):
         return None
+    train_set, valid_set, test_set = load_pickle(path)
+    train_ds = make_dataset(train_set)
+    valid_ds = make_dataset(valid_set)
+    test_ds = make_dataset(test_set)
+    if len(train_ds) == 0:
+        return None
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle_train, num_workers=workers)
+    valid_dl = DataLoader(valid_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    return train_dl, valid_dl, test_dl
 
 
-def train(dataloader, model, loss_fn, optimizer, scheduler, relation, reg=False, num_unseen=0):
+class LinearAggregator(nn.Module):
+    def __init__(self, num_rules, pad_tok, init_confs, sign_constraint=False):
+        super().__init__()
+        self.rules = nn.Embedding(num_rules + 1, 1, padding_idx=pad_tok)
+        self.bias = nn.Parameter(torch.zeros(1, 1))
+        self.sign_constraint = sign_constraint
+        with torch.no_grad():
+            self.rules.weight[:num_rules] = torch.from_numpy(init_confs).reshape(-1, 1).float()
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[:num_rules].reshape(1, -1))
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            self.bias.uniform_(-bound, bound)
+
+    def forward(self, rules):
+        mask = rules == self.rules.padding_idx
+        x = self.rules(rules)
+        x.masked_fill_(mask.unsqueeze(dim=2), 0.0)
+        if self.sign_constraint:
+            x = x**2
+        return x.sum(dim=1) + self.bias
+
+
+class NoisyOrAggregator(nn.Module):
+    def __init__(self, num_rules, pad_tok, init_confs):
+        super().__init__()
+        self.rules = nn.Embedding(num_rules + 1, 1, padding_idx=pad_tok)
+        with torch.no_grad():
+            confs = torch.from_numpy(np.clip(init_confs, 1e-6, 1 - 1e-6)).reshape(-1, 1).float()
+            self.rules.weight[:num_rules] = torch.log(confs / (1 - confs))
+
+    def forward(self, rules):
+        mask = rules == self.rules.padding_idx
+        x = self.rules(rules)
+        x.masked_fill_(mask.unsqueeze(dim=2), float("-inf"))
+        no = 1 - (1 - torch.sigmoid(x)).prod(dim=1)
+        return no.clamp(min=1e-4, max=1 - 1e-5)
+
+
+def bce_loss_r(weights):
+    def loss(input, target):
+        input = torch.clamp(input, min=1e-7, max=1 - 1e-7)
+        return torch.mean(-weights[1] * target * torch.log(input) - (1 - target) * weights[0] * torch.log(1 - input))
+
+    return loss
+
+
+def train_one_epoch(dataloader, model, loss_fn, optimizer, device, reg=False, num_unseen=0):
     model.train()
-    train_loss = 0
-    n_loss = 0
+    total = 0.0
+    n = 0
     for i, (rules, y) in enumerate(dataloader):
-
-        # compute regularization
         if reg and num_unseen > 0:
-            num_batches = len(dataloader)
-            if num_unseen > num_batches:
-                num_unseen = num_batches
-            if i % int(num_batches / num_unseen) == 0:
-                rule_confs = torch.nn.functional.sigmoid(model.rules.weight)
-                sudo_false = torch.zeros_like(rule_confs)
-                loss = loss_fn(rule_confs, sudo_false) / dataloader.batch_size
+            num_batches = max(len(dataloader), 1)
+            unseen = min(num_unseen, num_batches)
+            step = max(int(num_batches / unseen), 1)
+            if i % step == 0:
+                rule_confs = torch.sigmoid(model.rules.weight)
+                pseudo_false = torch.zeros_like(rule_confs)
+                loss_reg = torch.nn.functional.binary_cross_entropy(rule_confs, pseudo_false)
                 optimizer.zero_grad()
-                loss.backward()
+                loss_reg.backward()
                 optimizer.step()
 
-        # Compute prediction error
-
-        rules = rules.to(args.device)
-        y = y.to(args.device)
-        pred = model(rules, relation)
+        rules = rules.to(device)
+        y = y.to(device)
+        pred = model(rules)
         loss = loss_fn(pred.reshape(-1, 1), y)
-
-        train_loss += loss.item()
-        n_loss += 1
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        total += loss.item()
+        n += 1
+    return total / max(n, 1)
 
-    return train_loss / n_loss
+
+def remap_rule_sequence(seq, global_to_local, pad_tok):
+    return [global_to_local.get(int(x), pad_tok) for x in seq]
 
 
-def test(dataloader, model, loss_fn, relation):
-    size = len(dataloader.dataset)
-    num_batches = len(dataloader)
-    model.eval()
-    test_loss, correct = 0, 0
+def rank_batch(model, golds, candidates, rules, test_filter, num_entities, pad_tok, model_name):
+    batch_rank = []
+    batch_rank_raw = []
+    if len(candidates) == 0 or len(rules) == 0:
+        return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
+
+    fill_value = 0.0
+    scores = torch.full((num_entities,), fill_value)
+    scores_raw = torch.full((num_entities,), fill_value)
+
+    rules_t = torch.nested.to_padded_tensor(torch.nested.nested_tensor([torch.tensor(x) for x in rules]), padding=pad_tok).long()
+    if rules_t.numel() == 0:
+        return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
+
     with torch.no_grad():
-        for i, (rules, y) in enumerate(dataloader):
+        pred = model(rules_t).detach().cpu()
+        if model_name != "NoisyOrAggregator":
+            pred = torch.sigmoid(pred)
 
-            rules = rules.to(args.device)
-            y = y.to(args.device)
+    max_conf = (rules_t != pad_tok).float().amax(dim=1).reshape(-1, 1)
+    scores[candidates] = (pred * max_conf).squeeze(dim=1)
+    scores_raw[candidates] = pred.squeeze(dim=1)
 
-            pred = model(rules, relation).reshape(-1, 1)
+    def calc_rank(vals):
+        vals = -1 * vals
+        out = []
+        gold_scores = vals[golds].clone()
+        vals[golds] = fill_value
+        if test_filter is not None:
+            vals[test_filter] = fill_value
+        for i, gold in enumerate(golds):
+            g = gold.item()
+            vals[g] = gold_scores[i]
+            ranking = scipy.stats.rankdata(vals.numpy())
+            out.append(ranking[g])
+            vals[g] = fill_value
+        return out
 
-            loss = loss_fn(pred, y)
-            test_loss += loss.item()
-
-            correct += ((torch.sigmoid(pred) > 0.5) == y.to(args.device)).type(torch.float).sum().item()
-    test_loss /= num_batches
-    correct /= size
-    logging.info(f"Test Error: Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f}")
-    return test_loss
-
-
-def get_conf(x):
-    if x == PAD_TOK:
-        return 0.0
-    rule = rule_features[x]
-    return int(rule[1]) / (int(rule[0]) + 5)
-
-
-get_conf = np.vectorize(get_conf, otypes=[float])
-
-
-def rank_batch(nnm, golds, candidates, rules, test_filter, relation):
-
-    batch_rank, batch_rank_raw = [], []
-    if len(candidates) > 0 and len(rules) > 0:
-        fill_value = 0.0
-        scores = torch.full((dataset.num_entities(),), fill_value)
-        scores_raw = torch.full((dataset.num_entities(),), fill_value)
-
-        rules_ = torch.nested.to_padded_tensor(
-            torch.nested.nested_tensor([torch.tensor(x) for x in rules]), padding=PAD_TOK
-        ).long()
-        if rules_.numel() == 0:
-            return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
-
-        with torch.no_grad():
-            pred = nnm(rules_, relation).detach()
-            if args.model != "NoisyOrAggregator":
-                pred = torch.sigmoid(pred).detach()
-
-        max_conf = get_conf(rules_.cpu()).max(axis=1).reshape(-1, 1).astype(np.float32)
-
-        scores[candidates] = (pred * max_conf).squeeze(dim=1)
-        scores_raw[candidates] = pred.squeeze(dim=1)
-
-        def get_rank(scores):
-            batch_rank = []
-            scores = -1 * scores
-            gold_scores = scores[golds].clone()
-            scores[golds] = fill_value
-            if test_filter is not None:
-                scores[test_filter] = fill_value
-            for ix, gold in enumerate(golds):
-                gold = gold.item()
-                scores[gold] = gold_scores[ix]
-                ranking = scipy.stats.rankdata(scores.detach().numpy())  # .detach().numpy()
-                batch_rank.append(ranking[gold])
-                scores[gold] = fill_value
-            return batch_rank
-
-        batch_rank = get_rank(scores)
-        batch_rank_raw = get_rank(scores_raw)
-
+    batch_rank = calc_rank(scores)
+    batch_rank_raw = calc_rank(scores_raw)
     return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
 
 
-def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=False, file=None, fill_value=0.0):
-    nnm.eval()
+def get_ranks(model, sp_to_o, processed, relation, direction, filter_test, test_sp_to_o, test_po_to_s, num_entities, pad_tok, model_name):
     if direction == "o":
-        # sp
-        keys = [key for key in sp_to_o.keys() if key[1] == relation]
+        keys = [k for k in sp_to_o.keys() if k[1] == relation]
     else:
-        # po
-        keys = [key for key in sp_to_o.keys() if key[0] == relation]
-
+        keys = [k for k in sp_to_o.keys() if k[0] == relation]
     if len(keys) == 0:
         return torch.tensor([]), torch.tensor([]), 0
 
-    data = []
+    all_rank = []
+    all_rank_raw = []
+    n_total = 0
+
     for key in keys:
         test_filter = None
         if filter_test:
-            if direction == "o":
-                if key in test_sp_to_o.keys():
-                    test_filter = test_sp_to_o[key].long()
-            else:
-                if key in test_po_to_s.keys():
-                    test_filter = test_po_to_s[key].long()
+            if direction == "o" and key in test_sp_to_o:
+                test_filter = test_sp_to_o[key].long()
+            if direction == "s" and key in test_po_to_s:
+                test_filter = test_po_to_s[key].long()
 
         golds = sp_to_o[key].long()
         candidates = []
@@ -198,394 +225,259 @@ def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=Fals
         if key in processed:
             candidates = processed[key]["candidates"]
             rules = processed[key]["rules"]
-        data.append((nnm, golds, candidates, rules, test_filter, relation))
 
-    data = itertools.starmap(rank_batch, data)
-    rank, rank_raw, ns = zip(*data)
-    return torch.hstack(rank), torch.hstack(rank_raw), sum(ns)
+        rank, rank_raw, n = rank_batch(model, golds, candidates, rules, test_filter, num_entities, pad_tok, model_name)
+        all_rank.append(rank)
+        all_rank_raw.append(rank_raw)
+        n_total += n
 
-
-class LinearAggregator(nn.Module):
-    def init_weights(self):
-        with torch.no_grad():
-            for r in rule_map:
-                torch.manual_seed(0)
-                rules = rule_map[r]
-                self.rules.weight[rules] = torch.from_numpy(get_conf(rules)).reshape(-1, 1).float()
-                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[rules].reshape(1, -1))
-                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-                self.bias[r] = self.bias[r].uniform_(-bound, bound)
-
-    def __init__(self, sign_constraint=False):
-        super().__init__()
-        self.rules = nn.Embedding(LEN_RULES + 1, 1, padding_idx=PAD_TOK)
-        self.bias = nn.Parameter(torch.zeros(dataset.num_relations(), 1))  # len relations, 100
-        self.init_weights()
-        self.sign_constraint = sign_constraint
-
-    def forward(self, rules, relation):
-        mask = rules == PAD_TOK
-        rules = self.rules(rules)
-        rules.masked_fill_(mask.unsqueeze(dim=2), 0.0)
-        if self.sign_constraint:
-            rules = rules**2
-        logits = rules.sum(dim=1) + self.bias[relation]
-        return logits
+    return torch.hstack(all_rank), torch.hstack(all_rank_raw), n_total
 
 
-class NoisyOrAggregator(nn.Module):
-    def init_weights(self):
-        with torch.no_grad():
-            for r in rule_map:
-                torch.manual_seed(0)
-                rules = rule_map[r]
-                confs = torch.from_numpy(get_conf(rules)).reshape(-1, 1).float()
-                logit_values = torch.log(confs / (1 - confs))
-                self.rules.weight[rules] = logit_values.float()
-
-    def __init__(self):
-        super().__init__()
-        self.rules = nn.Embedding(LEN_RULES + 1, 1, padding_idx=PAD_TOK)
-        self.init_weights()
-
-    def forward(self, rules, relation):
-        mask = rules == PAD_TOK
-        rules = self.rules(rules)
-        rules.masked_fill_(mask.unsqueeze(dim=2), float("-inf"))
-        no = 1 - (1 - torch.nn.functional.sigmoid(rules)).prod(dim=1)
-        no = no.clamp(min=0.0001, max=0.99999)
-        return no
+def calc_metrics(ranks, n):
+    if n == 0 or len(ranks) == 0:
+        return {"mrr": 0.0, "h1": 0.0, "h10": 0.0}
+    return {
+        "mrr": ((1 / ranks).sum() / n).item(),
+        "h1": ((ranks == 1.0).sum() / n).item(),
+        "h10": ((ranks <= 10.0).sum() / n).item(),
+    }
 
 
-def calc_mrr(tail_mrr, head_mrr, attr="maximums_t"):
-    head_rank = 0
-    tail_rank = 0
-    head_rank_raw = 0
-    tail_rank_raw = 0
-    n = 0
-    for ix in range(dataset.num_relations()):
-        rn = test_torch[test_torch[:, 1] == ix].shape[0]
-        tail_rank += getattr(tail_mrr, attr).get(ix, 0.0) * rn
-        head_rank += getattr(head_mrr, attr).get(ix, 0.0) * rn
-        tail_rank_raw += getattr(tail_mrr, attr + "_raw").get(ix, 0.0) * rn
-        head_rank_raw += getattr(head_mrr, attr + "_raw").get(ix, 0.0) * rn
-        n += rn
-    return (head_rank + tail_rank) / (2 * n), (head_rank_raw + tail_rank_raw) / (2 * n)
-
-
-class MRR:
-    def __init__(self, direction="o"):
-        self.direction = direction
-
-        self.best_hps = {}
-        self.best_hps_raw = {}
-
-        self.maximums_v = defaultdict(float)
-        self.maximums_v_raw = defaultdict(float)
-
-        self.maximums_t = defaultdict(float)
-        self.maximums_t_raw = defaultdict(float)
-        self.maximums_t_1 = defaultdict(float)
-        self.maximums_t_1_raw = defaultdict(float)
-        self.maximums_t_10 = defaultdict(float)
-        self.maximums_t_10_raw = defaultdict(float)
-
-        self.valid_sp_to_o = valid_sp_to_o if direction == "o" else valid_po_to_s
-        self.valid_processed = processed_sp_valid if direction == "o" else processed_po_valid
-        self.test_sp_to_o = test_sp_to_o if direction == "o" else test_po_to_s
-        self.test_processed = processed_sp_test if direction == "o" else processed_po_test
-        self.nnm = dict()
-        self.nnm_raw = dict()
-
-    def calc_metrics_(self, ranks, n):
-        if n == 0:
-            return 0.0, 0.0, 0.0
-        mrr = ((1 / ranks).sum() / n).item()
-        h1 = ((ranks == 1.0).sum() / n).item()
-        h10 = ((ranks <= 10.0).sum() / n).item()
-        return mrr, h1, h10
-
-    def calc_metrics(self, nnm, sp_to_o, processed, relation, direction, filter_test=False):
-        ranks, ranks_raw, n = get_ranks(nnm, sp_to_o, processed, relation, direction, filter_test)
-        mrr, h1, h10 = self.calc_metrics_(ranks, n)
-        mrr_raw, h1_raw, h10_raw = self.calc_metrics_(ranks_raw, n)
-        return (mrr, h1, h10, mrr_raw, h1_raw, h10_raw)
-
-    def update(self, nnm, relation, hps):
-        (v_mrr, v_h1, v_h10, v_mrr_raw, v_h1_raw, v_h10_raw) = self.calc_metrics(
-            nnm, self.valid_sp_to_o, self.valid_processed, relation, direction=self.direction, filter_test=True
-        )
-        if (v_mrr > self.maximums_v[relation]) or (v_mrr_raw > self.maximums_v_raw[relation]):
-            (t_mrr, t_h1, t_h10, t_mrr_raw, t_h1_raw, t_h10_raw) = self.calc_metrics(
-                nnm, self.test_sp_to_o, self.test_processed, relation, direction=self.direction
-            )
-            if v_mrr > self.maximums_v[relation]:
-                self.maximums_v[relation] = v_mrr
-                self.maximums_t[relation] = t_mrr
-                self.maximums_t_1[relation] = t_h1
-                self.maximums_t_10[relation] = t_h10
-                self.nnm[relation] = copy.deepcopy(nnm)
-                self.best_hps[relation] = hps
-
-            if v_mrr_raw > self.maximums_v_raw[relation]:
-                self.maximums_v_raw[relation] = v_mrr_raw
-                self.maximums_t_raw[relation] = t_mrr_raw
-                self.maximums_t_1_raw[relation] = t_h1_raw
-                self.maximums_t_10_raw[relation] = t_h10_raw
-                self.nnm_raw[relation] = copy.deepcopy(nnm)
-                self.best_hps_raw[relation] = hps
-
-
-class SharedDataset(Dataset):
-    def get_empty_shared_array(self, shape, type_):
-        shared_array_base = mp.Array(type_, torch.tensor(shape).prod().item())
-        shared_array = np.ctypeslib.as_array(shared_array_base.get_obj())
-        shared_array = shared_array.reshape(*shape)
-        return torch.from_numpy(shared_array)
-
-    def __init__(self, xs, ys):
-        self.shared_x = self.get_empty_shared_array(xs.shape, ctypes.c_int)
-        self.shared_x[:] = xs
-        self.shared_y = self.get_empty_shared_array(ys.shape, ctypes.c_float)
-        self.shared_y[:] = ys
-        self.use_cache = False
-        self.len = xs.shape[0]
-
-    def __getitem__(self, index):
-        x = self.shared_x[index]
-        y = self.shared_y[index]
-        return x, y
-
-    def __len__(self):
-        return self.len
-
-
-def load_dataloaders(dataset_directory, relation):
-
-    (train_set, valid_set, test_set) = load(dataset_directory, f"dataset_{relation}")
-
-    weight_t = (valid_set.datasets[0].tensors[4] == 0).sum() / (valid_set.datasets[0].tensors[4] == 1).sum()
-    weight_h = (valid_set.datasets[1].tensors[4] == 0).sum() / (valid_set.datasets[1].tensors[4] == 1).sum()
-
-    train_set = SharedDataset(
-        torch.vstack((train_set.datasets[0].tensors[3], train_set.datasets[1].tensors[3])),
-        torch.vstack((train_set.datasets[0].tensors[4], train_set.datasets[1].tensors[4])),
-    )
-    valid_set = SharedDataset(
-        torch.vstack((valid_set.datasets[0].tensors[3], valid_set.datasets[1].tensors[3])),
-        torch.vstack((valid_set.datasets[0].tensors[4], valid_set.datasets[1].tensors[4])),
-    )
-    test_set = SharedDataset(
-        torch.vstack((test_set.datasets[0].tensors[3], test_set.datasets[1].tensors[3])),
-        torch.vstack((test_set.datasets[0].tensors[4], test_set.datasets[1].tensors[4])),
-    )
-
-    if len(train_set) == 0:
-        return None, None
-    train_dataloader = DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=args.shuffle_train, num_workers=args.max_worker_dataloader
-    )
-    valid_dataloader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False)
-    test_dataloader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False)
-    return (weight_t, weight_h), (train_dataloader, valid_dataloader, test_dataloader)
-
-
-def get_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-c", "--config", action="store", help="Path to config file; ORDER: default->command line->config file",
-        default="config-base.json"
-    )
-    parser.add_argument("-d", "--dataset", action="store", help="Name of dataset (libkge)", default="codex-m")
-    parser.add_argument("-dev", "--device", action="store", help="Device cpu/cuda", default="cuda")
-    parser.add_argument(
-        "--max_worker_dataloader",
-        action="store",
-        help="Number of processes for dataloader",
-        default=len(os.sched_getaffinity(0)) - 1,
-    )
-    parser.add_argument(
-        "--max_worker_mrr",
-        action="store",
-        help="Number of processes working on MRR evaluation",
-        default=len(os.sched_getaffinity(0)) - 1,
-    )
-    parser.add_argument(
-        "--model",
-        action="store",
-        help="Aggregator to use; one of ['LinearAggregator', 'PNAAggregator']",
-        default="LinearAggregator",
-    )
-    parser.add_argument("--shuffle_train", action="store_true", help="Shuffles the examples before creating batches")
-    parser.add_argument("--batch_size", action="store", help="Size of batch", default=4096)
-    parser.add_argument(
-        "--lr_hpo", action="store", nargs="+", default=[0.001, 0.01], help="Learning rates of the adam optimizer"
-    )
-    parser.add_argument(
-        "--max_epoch_hpo",
-        action="store",
-        nargs="+",
-        default=[20, 10],
-        help="Epochs to run for each learning rate; max_epoch[i] are trained using lr[i]",
-    )
-    parser.add_argument(
-        "--pos_hpo",
-        action="store",
-        nargs="+",
-        default=[5, 15, 30, 100, 400],
-        help="Scaling of the loss for positive examples, controls precision/recall",
-    )
-    parser.add_argument(
-        "--sign_constraint",
-        action="store_true",
-        help="Constrains the rule weights to be >=0. Only implemented for LinearAggregator.",
-    )
-    parser.add_argument(
-        "--noisy_or_reg", action="store_true", help="Sudo negative examples for noisy-or learning.", default=False
-    )
-    parser.add_argument(
-        "--num_unseen", action="store_true", help="Num Sudo negative examples for noisy-or learning.", default=0
-    )
-
-    return parser
-
-
-def BCELossR(weights=[1, 1], reduction="mean", apply_sigmoid=False):
-    def loss(input, target):
-        if apply_sigmoid:
-            input = torch.sigmoid(input)
-            input = torch.clamp(input, min=1e-7, max=1 - 1e-7)
-        bce = -weights[1] * target * torch.log(input) - (1 - target) * weights[0] * torch.log(1 - input)
-        if reduction == "libkge":
-            bce = (
-                bce[target.bool()].sum() / target.bool().sum() + bce[~target.bool()].sum() / (~target.bool()).sum()
-            ) / 2.0
-        elif reduction == "sum":
-            bce = torch.sum(bce)
-        elif reduction == "mean":
-            bce = torch.mean(bce)
-        return bce
-
-    return loss
-
-
-if __name__ == "__main__":
+def main():
     args = get_parser().parse_args()
-    args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"
-    args.directory_preprocessed_datasets = f"./{args.dataset}/datasets/"
-    time = datetime.now().strftime("%m%d-%H%M")
-    args.experiment = f"./{args.dataset}/exp-{time}"
-    if args.config is not None:
+    if args.config:
         with open(args.config) as f:
-            config = json.load(f)
-            args_dict = vars(args)
-            assert set(config.keys()).issubset(args_dict.keys()), "There are keys in you config file not recognized"
-            args = Namespace(**{**args_dict, **config})
+            cfg = json.load(f)
+        args_dict = vars(args)
+        assert set(cfg.keys()).issubset(args_dict.keys())
+        args = Namespace(**{**args_dict, **cfg})
 
-    # Set up experiment folder
-    if not os.path.exists(args.experiment):
-        os.makedirs(args.experiment)
-    # Copy stuff for reproducibility
-    shutil.copy(__file__, args.experiment)
-    with open(f"{args.experiment}/config.json", "w") as f:
-        json.dump(vars(args), f, indent=4)
-    # Set up logger
+    exp_root = args.experiment_root or f"./{args.dataset}/single-rel-{datetime.now().strftime('%m%d-%H%M%S')}"
+    os.makedirs(exp_root, exist_ok=True)
+    rel_dir = os.path.join(exp_root, f"relation_{args.relation}")
+    os.makedirs(rel_dir, exist_ok=True)
+
     logging.basicConfig(
-        filename=f"{args.experiment}/run.log",
+        filename=os.path.join(rel_dir, "run.log"),
         filemode="w",
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         force=True,
     )
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    logging.getLogger().addHandler(ch)
-    logging.info(f"Starting experiment {args.experiment}")
+    logging.getLogger().addHandler(logging.StreamHandler())
     logging.info(pformat(vars(args)))
 
     c = kge.Config()
     c.set("dataset.name", args.dataset)
     dataset = kge.Dataset.create(c)
 
+    rel = args.relation
     test_sp_to_o = dataset.index("test_sp_to_o")
     test_po_to_s = dataset.index("test_po_to_s")
-    test_torch = dataset.split("test")
-
     valid_sp_to_o = dataset.index("valid_sp_to_o")
     valid_po_to_s = dataset.index("valid_po_to_s")
-    valid_torch = dataset.split("valid")
 
-    dataloaders = dict()
-    weights = dict()
-    for relation in range(dataset.num_relations()):
-        weight, dataloader = load_dataloaders(args.directory_preprocessed_datasets, relation)
-        dataloaders[relation] = dataloader
-        weights[relation] = weight
+    expl_dir = f"./{args.dataset}/expl/explanations-processed"
+    ds_dir = f"./{args.dataset}/datasets"
 
-    processed_sp_test = pickle.load(open(args.directory_explanations + "processed_sp_test.pkl", "rb"))
-    processed_po_test = pickle.load(open(args.directory_explanations + "processed_po_test.pkl", "rb"))
+    dataloaders = build_dataloaders(ds_dir, rel, args.batch_size, args.shuffle_train, args.max_worker_dataloader)
+    if dataloaders is None:
+        out_path = args.output_json or os.path.join(exp_root, f"relation_{rel}.json")
+        with open(out_path, "w") as f:
+            json.dump({"relation": rel, "skipped": True, "reason": "empty_or_missing_dataset"}, f, indent=2)
+        return
 
-    processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_sp_valid.pkl", "rb"))
-    processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
+    train_dl, _, _ = dataloaders
 
-    rule_map = pickle.load(open(args.directory_explanations + "rule_map.pkl", "rb"))
-    rule_features = pickle.load(open(args.directory_explanations + "rule_features.pkl", "rb"))
-    ruleid2relid = {ruleid: relid for relid in rule_map for ruleid in rule_map[relid]}
+    processed_sp_test = load_pickle(os.path.join(expl_dir, "processed_sp_test.pkl"))
+    processed_po_test = load_pickle(os.path.join(expl_dir, "processed_po_test.pkl"))
+    processed_sp_valid = load_pickle(os.path.join(expl_dir, "processed_sp_valid.pkl"))
+    processed_po_valid = load_pickle(os.path.join(expl_dir, "processed_po_valid.pkl"))
 
-    filter_test = set([tuple(x.tolist()) for x in test_torch])
-    filter_valid = set([tuple(x.tolist()) for x in valid_torch])
+    rule_map = load_pickle(os.path.join(expl_dir, "rule_map.pkl"))
+    rule_features = load_pickle(os.path.join(expl_dir, "rule_features.pkl"))
 
-    LEN_RULES = len(rule_features)
-    PAD_TOK = LEN_RULES
+    relation_rules_global = rule_map.get(rel, [])
+    global_to_local = {rid: i for i, rid in enumerate(relation_rules_global)}
+    local_rule_count = len(relation_rules_global)
+    pad_tok = local_rule_count
 
-    for pos in args.pos_hpo:
-        # for unseen in args.num_unseen:
-        unseen = args.num_unseen
-        for ix, (lr, max_epoch) in enumerate(zip(args.lr_hpo, args.max_epoch_hpo)):
-            tail_mrr = MRR(direction="o")
-            head_mrr = MRR(direction="s")
-            logging.info(f"Pos weight: {pos}, Lr: {lr}, Max epoch: {max_epoch}")
-            if args.model == "LinearAggregator":
-                nnm = LinearAggregator(sign_constraint=args.sign_constraint)
-            elif args.model == "NoisyOrAggregator":
-                nnm = NoisyOrAggregator()
-            nnm = nnm.to(args.device)
-            logging.info(nnm)
+    if local_rule_count == 0:
+        out_path = args.output_json or os.path.join(exp_root, f"relation_{rel}.json")
+        with open(out_path, "w") as f:
+            json.dump({"relation": rel, "skipped": True, "reason": "no_rules_for_relation"}, f, indent=2)
+        return
 
-            optimizer = torch.optim.Adam(nnm.parameters(), lr=lr)
+    confs = []
+    for rid in relation_rules_global:
+        rule = rule_features[rid]
+        confs.append(int(rule[1]) / (int(rule[0]) + 5))
+    confs = np.array(confs, dtype=np.float32)
 
-            for t in range(max_epoch):
-                for relation in tqdm(range(dataset.num_relations())):
-                    dataloader = dataloaders[relation]
-                    weight = weights[relation]
-                    if dataloader is None:
-                        continue
-                    (train_dataloader, valid_dataloader, test_dataloader) = dataloader
-                    if train_dataloader is None:
-                        continue
+    # 将训练 batch 中的全局 rule id 映射到单 relation 局部 rule id
+    def remap_batch_rules(batch_rules):
+        remapped = batch_rules.clone()
+        for i in range(batch_rules.shape[0]):
+            for j in range(batch_rules.shape[1]):
+                remapped[i, j] = global_to_local.get(int(batch_rules[i, j].item()), pad_tok)
+        return remapped
 
-                    if args.model == "LinearAggregator":
-                        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos).float())
-                    elif args.model == "NoisyOrAggregator":
-                        loss_fn = BCELossR([1, pos])
+    class RemapLoader:
+        def __init__(self, inner_loader):
+            self.inner_loader = inner_loader
+            self.batch_size = inner_loader.batch_size
 
-                    loss = train(
-                        train_dataloader, nnm, loss_fn, optimizer, None, relation, args.noisy_or_reg, unseen
-                    )
-                    nnm.cpu()
-                    head_mrr.update(nnm, relation, (pos, lr, t))
-                    tail_mrr.update(nnm, relation, (pos, lr, t))
-                    nnm.to(args.device)
-                    max_tail_mrr = tail_mrr.maximums_t_raw[relation]
-                    max_head_mrr = head_mrr.maximums_t_raw[relation]
-                    logging.info(
-                        f"{relation} tail loss: {loss:>7f} {max_tail_mrr} {max_head_mrr} [{t:>5d}/{max_epoch:>5d}]"
-                    )
+        def __iter__(self):
+            for rules, y in self.inner_loader:
+                yield remap_batch_rules(rules), y
 
-            logging.info(calc_mrr(tail_mrr, head_mrr))
-            logging.info(calc_mrr(tail_mrr, head_mrr, "maximums_t_1"))
-            logging.info(calc_mrr(tail_mrr, head_mrr, "maximums_t_10"))
-            save(head_mrr, args.experiment, f"head_mrr_{pos}_{lr}")
-            save(tail_mrr, args.experiment, f"tail_mrr_{pos}_{lr}")
+        def __len__(self):
+            return len(self.inner_loader)
 
-    logging.info("Done")
+    train_dl = RemapLoader(train_dl)
+
+    def remap_processed(proc):
+        out = {}
+        for k, v in proc.items():
+            if (k[1] == rel) or (k[0] == rel):
+                rr = [remap_rule_sequence(seq, global_to_local, pad_tok) for seq in v["rules"]]
+                out[k] = {"candidates": v["candidates"], "rules": rr}
+        return out
+
+    processed_sp_valid_rel = remap_processed(processed_sp_valid)
+    processed_po_valid_rel = remap_processed(processed_po_valid)
+    processed_sp_test_rel = remap_processed(processed_sp_test)
+    processed_po_test_rel = remap_processed(processed_po_test)
+
+    if args.model == "LinearAggregator":
+        model = LinearAggregator(local_rule_count, pad_tok, confs, args.sign_constraint)
+        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(args.pos).float())
+    else:
+        model = NoisyOrAggregator(local_rule_count, pad_tok, confs)
+        loss_fn = bce_loss_r([1, args.pos])
+
+    model = model.to(args.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best = {
+        "valid_mrr": -1.0,
+        "valid_mrr_raw": -1.0,
+        "epoch": -1,
+        "metrics": None,
+    }
+
+    for epoch in range(args.max_epoch):
+        loss = train_one_epoch(train_dl, model, loss_fn, optimizer, args.device, args.noisy_or_reg, args.num_unseen)
+
+        model_cpu = model.cpu()
+        v_tail, v_tail_raw, n_vt = get_ranks(
+            model_cpu, valid_sp_to_o, processed_sp_valid_rel, rel, "o", True,
+            test_sp_to_o, test_po_to_s, dataset.num_entities(), pad_tok, args.model
+        )
+        v_head, v_head_raw, n_vh = get_ranks(
+            model_cpu, valid_po_to_s, processed_po_valid_rel, rel, "s", True,
+            test_sp_to_o, test_po_to_s, dataset.num_entities(), pad_tok, args.model
+        )
+        t_tail, t_tail_raw, n_tt = get_ranks(
+            model_cpu, test_sp_to_o, processed_sp_test_rel, rel, "o", False,
+            test_sp_to_o, test_po_to_s, dataset.num_entities(), pad_tok, args.model
+        )
+        t_head, t_head_raw, n_th = get_ranks(
+            model_cpu, test_po_to_s, processed_po_test_rel, rel, "s", False,
+            test_sp_to_o, test_po_to_s, dataset.num_entities(), pad_tok, args.model
+        )
+
+        valid_tail = calc_metrics(v_tail, n_vt)
+        valid_head = calc_metrics(v_head, n_vh)
+        valid_tail_raw = calc_metrics(v_tail_raw, n_vt)
+        valid_head_raw = calc_metrics(v_head_raw, n_vh)
+
+        test_tail = calc_metrics(t_tail, n_tt)
+        test_head = calc_metrics(t_head, n_th)
+        test_tail_raw = calc_metrics(t_tail_raw, n_tt)
+        test_head_raw = calc_metrics(t_head_raw, n_th)
+
+        valid_mrr = (valid_head["mrr"] + valid_tail["mrr"]) / 2
+        valid_mrr_raw = (valid_head_raw["mrr"] + valid_tail_raw["mrr"]) / 2
+
+        current = {
+            "epoch": epoch,
+            "train_loss": loss,
+            "valid": {
+                "head": valid_head,
+                "tail": valid_tail,
+                "mean": {
+                    "mrr": valid_mrr,
+                    "h1": (valid_head["h1"] + valid_tail["h1"]) / 2,
+                    "h10": (valid_head["h10"] + valid_tail["h10"]) / 2,
+                },
+                "head_raw": valid_head_raw,
+                "tail_raw": valid_tail_raw,
+                "mean_raw": {
+                    "mrr": valid_mrr_raw,
+                    "h1": (valid_head_raw["h1"] + valid_tail_raw["h1"]) / 2,
+                    "h10": (valid_head_raw["h10"] + valid_tail_raw["h10"]) / 2,
+                },
+            },
+            "test": {
+                "head": test_head,
+                "tail": test_tail,
+                "mean": {
+                    "mrr": (test_head["mrr"] + test_tail["mrr"]) / 2,
+                    "h1": (test_head["h1"] + test_tail["h1"]) / 2,
+                    "h10": (test_head["h10"] + test_tail["h10"]) / 2,
+                },
+                "head_raw": test_head_raw,
+                "tail_raw": test_tail_raw,
+                "mean_raw": {
+                    "mrr": (test_head_raw["mrr"] + test_tail_raw["mrr"]) / 2,
+                    "h1": (test_head_raw["h1"] + test_tail_raw["h1"]) / 2,
+                    "h10": (test_head_raw["h10"] + test_tail_raw["h10"]) / 2,
+                },
+            },
+            "counts": {
+                "valid_head": n_vh,
+                "valid_tail": n_vt,
+                "test_head": n_th,
+                "test_tail": n_tt,
+            },
+        }
+
+        if (valid_mrr > best["valid_mrr"]) or (valid_mrr_raw > best["valid_mrr_raw"]):
+            best = {
+                "valid_mrr": max(best["valid_mrr"], valid_mrr),
+                "valid_mrr_raw": max(best["valid_mrr_raw"], valid_mrr_raw),
+                "epoch": epoch,
+                "metrics": current,
+            }
+
+        model = model_cpu.to(args.device)
+        logging.info(f"relation={rel} epoch={epoch} loss={loss:.6f} valid_mrr={valid_mrr:.6f} valid_mrr_raw={valid_mrr_raw:.6f}")
+
+    output = {
+        "relation": rel,
+        "config": {
+            "dataset": args.dataset,
+            "model": args.model,
+            "lr": args.lr,
+            "max_epoch": args.max_epoch,
+            "pos": args.pos,
+            "device": args.device,
+            "sign_constraint": args.sign_constraint,
+            "noisy_or_reg": args.noisy_or_reg,
+            "num_unseen": args.num_unseen,
+        },
+        "best_epoch": best["epoch"],
+        "result": best["metrics"],
+        "skipped": False,
+    }
+
+    out_path = args.output_json or os.path.join(exp_root, f"relation_{rel}.json")
+    with open(out_path, "w") as f:
+        json.dump(output, f, indent=2)
+    logging.info(f"Saved result to {out_path}")
+
+
+if __name__ == "__main__":
+    main()

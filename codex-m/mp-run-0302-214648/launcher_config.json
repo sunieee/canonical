@@ -1,0 +1,17 @@
+{
+  "dataset": "codex-m",
+  "device": "cuda",
+  "model": "LinearAggregator",
+  "lr": 0.01,
+  "max_epoch": 1,
+  "pos": 5.0,
+  "batch_size": 4096,
+  "shuffle_train": false,
+  "sign_constraint": false,
+  "noisy_or_reg": false,
+  "num_unseen": 0,
+  "max_worker_dataloader": 19,
+  "max_processes": 20,
+  "relations": null,
+  "experiment_root": "./codex-m/mp-run-0302-214648"
+}
