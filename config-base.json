@@ -1,28 +1,10 @@
 {
-    "dataset": "codex-m",
     "device": "cuda",
     "max_worker_dataloader": 3,
     "max_worker_mrr": 3,
-    "directory_explanations": "./codex-m/expl/explanations-processed/",
-    "directory_preprocessed_datasets": "./codex-m/datasets",
     "model": "LinearAggregator",
     "shuffle_train": false,
     "batch_size": 4096,
-    "lr_hpo": [
-        0.001,
-        0.01
-    ],
-    "max_epoch_hpo": [
-        20,
-        10
-    ],
-    "pos_hpo": [
-        5,
-        15,
-        30,
-        100,
-        400
-    ],
     "sign_constraint": false,
     "noisy_or_reg": false,
     "num_unseen": 0

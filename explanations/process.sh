@@ -1,5 +1,7 @@
 #!/bin/bash
-export dataset=fb15k-237
+if [ -z "${dataset+x}" ]; then
+  export dataset=codex-m
+fi
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_dir="$(cd "$script_dir/.." && pwd)"

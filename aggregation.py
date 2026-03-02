@@ -393,14 +393,8 @@ def load_dataloaders(dataset_directory, relation):
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-c", "--config", action="store", help="Path to config file; ORDER: default->command line->config file"
-    )
-    parser.add_argument(
-        "-e",
-        "--experiment",
-        action="store",
-        help="Name of experiment",
-        default=datetime.now().strftime("%Y-%m-%d-%H-%M-%S"),
+        "-c", "--config", action="store", help="Path to config file; ORDER: default->command line->config file",
+        default="config-base.json"
     )
     parser.add_argument("-d", "--dataset", action="store", help="Name of dataset (libkge)", default="codex-m")
     parser.add_argument("-dev", "--device", action="store", help="Device cpu/cuda", default="cuda")
@@ -415,18 +409,6 @@ def get_parser():
         action="store",
         help="Number of processes working on MRR evaluation",
         default=len(os.sched_getaffinity(0)) - 1,
-    )
-    parser.add_argument(
-        "--directory_explanations",
-        action="store",
-        help="Folder containing processed_train_sp, ...",
-        default="./codex-m/expl/explanations-processed/",
-    )
-    parser.add_argument(
-        "--directory_preprocessed_datasets",
-        action="store",
-        help="Directory containing prepared datasets (create_datasets.py)",
-        default="./codex-m/datasets",
     )
     parser.add_argument(
         "--model",
@@ -489,6 +471,10 @@ def BCELossR(weights=[1, 1], reduction="mean", apply_sigmoid=False):
 
 if __name__ == "__main__":
     args = get_parser().parse_args()
+    args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"
+    args.directory_preprocessed_datasets = f"./{args.dataset}/datasets/"
+    time = datetime.now().strftime("%m%d-%H%M")
+    args.experiment = f"./{args.dataset}/exp-{time}"
     if args.config is not None:
         with open(args.config) as f:
             config = json.load(f)
@@ -505,7 +491,7 @@ if __name__ == "__main__":
         json.dump(vars(args), f, indent=4)
     # Set up logger
     logging.basicConfig(
-        filename=f"{args.experiment}/{args.experiment}.log",
+        filename=f"{args.experiment}/run.log",
         filemode="w",
         level=logging.DEBUG,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -553,52 +539,53 @@ if __name__ == "__main__":
     PAD_TOK = LEN_RULES
 
     for pos in args.pos_hpo:
-        for unseen in args.num_unseen:
-            for ix, (lr, max_epoch) in enumerate(zip(args.lr_hpo, args.max_epoch_hpo)):
-                tail_mrr = MRR(direction="o")
-                head_mrr = MRR(direction="s")
-                logging.info(f"Pos weight: {pos}, Lr: {lr}, Max epoch: {max_epoch}")
-                if args.model == "LinearAggregator":
-                    nnm = LinearAggregator(sign_constraint=args.sign_constraint)
-                elif args.model == "NoisyOrAggregator":
-                    nnm = NoisyOrAggregator()
-                nnm = nnm.to(args.device)
-                logging.info(nnm)
+        # for unseen in args.num_unseen:
+        unseen = args.num_unseen
+        for ix, (lr, max_epoch) in enumerate(zip(args.lr_hpo, args.max_epoch_hpo)):
+            tail_mrr = MRR(direction="o")
+            head_mrr = MRR(direction="s")
+            logging.info(f"Pos weight: {pos}, Lr: {lr}, Max epoch: {max_epoch}")
+            if args.model == "LinearAggregator":
+                nnm = LinearAggregator(sign_constraint=args.sign_constraint)
+            elif args.model == "NoisyOrAggregator":
+                nnm = NoisyOrAggregator()
+            nnm = nnm.to(args.device)
+            logging.info(nnm)
 
-                optimizer = torch.optim.Adam(nnm.parameters(), lr=lr)
+            optimizer = torch.optim.Adam(nnm.parameters(), lr=lr)
 
-                for t in range(max_epoch):
-                    for relation in tqdm(range(dataset.num_relations())):
-                        dataloader = dataloaders[relation]
-                        weight = weights[relation]
-                        if dataloader is None:
-                            continue
-                        (train_dataloader, valid_dataloader, test_dataloader) = dataloader
-                        if train_dataloader is None:
-                            continue
+            for t in range(max_epoch):
+                for relation in tqdm(range(dataset.num_relations())):
+                    dataloader = dataloaders[relation]
+                    weight = weights[relation]
+                    if dataloader is None:
+                        continue
+                    (train_dataloader, valid_dataloader, test_dataloader) = dataloader
+                    if train_dataloader is None:
+                        continue
 
-                        if args.model == "LinearAggregator":
-                            loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos).float())
-                        elif args.model == "NoisyOrAggregator":
-                            loss_fn = BCELossR([1, pos])
+                    if args.model == "LinearAggregator":
+                        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos).float())
+                    elif args.model == "NoisyOrAggregator":
+                        loss_fn = BCELossR([1, pos])
 
-                        loss = train(
-                            train_dataloader, nnm, loss_fn, optimizer, None, relation, args.noisy_or_reg, unseen
-                        )
-                        nnm.cpu()
-                        head_mrr.update(nnm, relation, (pos, lr, t))
-                        tail_mrr.update(nnm, relation, (pos, lr, t))
-                        nnm.to(args.device)
-                        max_tail_mrr = tail_mrr.maximums_t_raw[relation]
-                        max_head_mrr = head_mrr.maximums_t_raw[relation]
-                        logging.info(
-                            f"{relation} tail loss: {loss:>7f} {max_tail_mrr} {max_head_mrr} [{t:>5d}/{max_epoch:>5d}]"
-                        )
+                    loss = train(
+                        train_dataloader, nnm, loss_fn, optimizer, None, relation, args.noisy_or_reg, unseen
+                    )
+                    nnm.cpu()
+                    head_mrr.update(nnm, relation, (pos, lr, t))
+                    tail_mrr.update(nnm, relation, (pos, lr, t))
+                    nnm.to(args.device)
+                    max_tail_mrr = tail_mrr.maximums_t_raw[relation]
+                    max_head_mrr = head_mrr.maximums_t_raw[relation]
+                    logging.info(
+                        f"{relation} tail loss: {loss:>7f} {max_tail_mrr} {max_head_mrr} [{t:>5d}/{max_epoch:>5d}]"
+                    )
 
-                logging.info(calc_mrr(tail_mrr, head_mrr))
-                logging.info(calc_mrr(tail_mrr, head_mrr, "maximums_t_1"))
-                logging.info(calc_mrr(tail_mrr, head_mrr, "maximums_t_10"))
-                save(head_mrr, args.experiment, f"head_mrr_{pos}_{lr}")
-                save(tail_mrr, args.experiment, f"tail_mrr_{pos}_{lr}")
+            logging.info(calc_mrr(tail_mrr, head_mrr))
+            logging.info(calc_mrr(tail_mrr, head_mrr, "maximums_t_1"))
+            logging.info(calc_mrr(tail_mrr, head_mrr, "maximums_t_10"))
+            save(head_mrr, args.experiment, f"head_mrr_{pos}_{lr}")
+            save(tail_mrr, args.experiment, f"tail_mrr_{pos}_{lr}")
 
     logging.info("Done")

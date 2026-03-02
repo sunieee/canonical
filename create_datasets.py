@@ -1,6 +1,7 @@
 import argparse
 import os
 import pickle
+from multiprocessing import Pool, cpu_count
 
 import torch
 from kge import Config, Dataset
@@ -83,6 +84,8 @@ def generate_dataset(relation):
     if args["output"] is not None:
         save((train_set, valid_set, test_set), args["output"], f"dataset_{relation}")
 
+    return relation
+
 
 if __name__ == "__main__":
 
@@ -134,5 +137,8 @@ if __name__ == "__main__":
     LEN_RULES = len(rule_features)
     PAD_TOK = LEN_RULES
 
-    for relation in tqdm(range(dataset.num_relations())):
-        generate_dataset(relation)
+    num_relations = dataset.num_relations()
+    num_workers = cpu_count()
+
+    with Pool(processes=num_workers) as pool:
+        list(tqdm(pool.imap_unordered(generate_dataset, range(num_relations)), total=num_relations))
