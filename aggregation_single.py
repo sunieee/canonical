@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # coding: utf-8
 import argparse
+import csv
 import copy
 import ctypes
 import itertools
 import json
-import logging
 import math
 import os
 import pickle
@@ -23,6 +23,7 @@ import torch
 from torch import multiprocessing as mp
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -33,7 +34,7 @@ def save(obj, folder, name=None, override=False):
         name = uuid.uuid4()
     if not os.path.exists(folder):
         os.makedirs(folder)
-    path_to_file = f"{folder}/{name}.p"
+    path_to_file = f"{folder}/{name}"
     if exists(path_to_file):
         print(f"Warning name {name} exists in cache, do you want to overwrite y/n?")
         confirm = input() if not override else "y"
@@ -45,9 +46,9 @@ def save(obj, folder, name=None, override=False):
 
 
 def load(folder, name):
-    path_to_file = f"{folder}/{name}.p"
+    path_to_file = f"{folder}/{name}"
     if exists(path_to_file):
-        return pickle.load(open(f"{folder}/{name}.p", "rb"))
+        return pickle.load(open(f"{folder}/{name}", "rb"))
     else:
         print("No such name in cache")
         return None
@@ -107,7 +108,6 @@ def test(dataloader, model, loss_fn):
             correct += ((torch.sigmoid(pred) > 0.5) == y.to(args.device)).type(torch.float).sum().item()
     test_loss /= num_batches
     correct /= size
-    logging.info(f"Test Error: Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f}")
     return test_loss
 
 
@@ -363,6 +363,24 @@ class MRR:
                 self.best_hps_raw = hps
 
 
+def compact_mrr_for_save(mrr_obj):
+    mrr_light = copy.copy(mrr_obj)
+
+    # Drop large references to dataset/processed structures
+    mrr_light.valid_sp_to_o = None
+    mrr_light.valid_processed = None
+    mrr_light.test_sp_to_o = None
+    mrr_light.test_processed = None
+
+    # Keep only model parameters instead of full model objects
+    if mrr_light.nnm is not None:
+        mrr_light.nnm = {k: v.detach().cpu() for k, v in mrr_light.nnm.state_dict().items()}
+    if mrr_light.nnm_raw is not None:
+        mrr_light.nnm_raw = {k: v.detach().cpu() for k, v in mrr_light.nnm_raw.state_dict().items()}
+
+    return mrr_light
+
+
 class SharedDataset(Dataset):
     def get_empty_shared_array(self, shape, type_):
         shared_array_base = mp.Array(type_, torch.tensor(shape).prod().item())
@@ -389,7 +407,7 @@ class SharedDataset(Dataset):
 
 def load_dataloaders(dataset_directory, relation):
 
-    train_set, _, _ = load(dataset_directory, f"dataset_{relation}")
+    train_set, _, _ = load(dataset_directory, f"dataset_{relation}.p")
 
     train_set = SharedDataset(
         torch.vstack((train_set.datasets[0].tensors[3], train_set.datasets[1].tensors[3])),
@@ -411,12 +429,6 @@ def get_parser():
         "--max_worker_dataloader",
         action="store",
         help="Number of processes for dataloader",
-        default=len(os.sched_getaffinity(0)) - 1,
-    )
-    parser.add_argument(
-        "--max_worker_mrr",
-        action="store",
-        help="Number of processes working on MRR evaluation",
         default=len(os.sched_getaffinity(0)) - 1,
     )
     parser.add_argument(
@@ -474,8 +486,6 @@ def aggregate_single(relation):
     unseen = args.num_unseen
     tail_mrr = MRR(relation=relation, direction="o")
     head_mrr = MRR(relation=relation, direction="s")
-    logging.info(f"Pos weight: {pos}, Lr: {lr}, Max epoch: {max_epoch}")
-
     if args.model == "LinearAggregator":
         nnm = LinearAggregator(relation=relation, sign_constraint=args.sign_constraint)
     elif args.model == "NoisyOrAggregator":
@@ -484,7 +494,6 @@ def aggregate_single(relation):
         raise ValueError(f"Unknown model: {args.model}")
 
     nnm = nnm.to(args.device)
-    logging.info(nnm)
 
     optimizer = torch.optim.Adam(nnm.parameters(), lr=lr)
     train_dataloader = dataloader
@@ -496,7 +505,8 @@ def aggregate_single(relation):
     elif args.model == "NoisyOrAggregator":
         loss_fn = BCELossR([1, pos])
 
-    for t in range(max_epoch):
+    pbar = tqdm(range(max_epoch), desc=f"r{relation}", leave=False)
+    for t in pbar:
         loss = train(train_dataloader, nnm, loss_fn, optimizer, args.noisy_or_reg, unseen)
         nnm.cpu()
         head_mrr.update(nnm, (pos, lr, t))
@@ -504,16 +514,31 @@ def aggregate_single(relation):
         nnm.to(args.device)
         max_tail_mrr = tail_mrr.maximums_t_raw
         max_head_mrr = head_mrr.maximums_t_raw
-        logging.info(
-            f"{relation} tail loss: {loss:>7f} {max_tail_mrr:>7f} {max_head_mrr:>7f} [{t:>5d}/{max_epoch:>5d}]"
-        )
+        max_mrr = (max_tail_mrr + max_head_mrr) / 2
+        pbar.set_postfix(tail_loss=f"{loss:.5f}", max_mrr=f"{max_mrr:.5f}")
 
     mrr, mrr_raw = calc_mrr(tail_mrr, head_mrr)
     h1, h1_raw = calc_mrr(tail_mrr, head_mrr, "maximums_t_1")
     h10, h10_raw = calc_mrr(tail_mrr, head_mrr, "maximums_t_10")
 
+    relation_rule_ids = sorted(rule_map.get(relation, []))
+    learned_weights = []
+    if len(relation_rule_ids) > 0:
+        with torch.no_grad():
+            local_weights = nnm.rules.weight[: nnm.num_relation_rules, 0].detach().cpu().numpy()
+            if args.model == "LinearAggregator" and args.sign_constraint:
+                local_weights = np.square(local_weights)
+            elif args.model == "NoisyOrAggregator":
+                local_weights = 1 / (1 + np.exp(-local_weights))
+            learned_weights = list(zip(relation_rule_ids, local_weights.tolist()))
+
+    num_test_samples = int(test_torch[test_torch[:, 1] == relation].shape[0])
+    num_relation_rules = int(len(relation_rule_ids))
+
     metrics = {
         "relation": int(relation),
+        "num_test_samples": num_test_samples,
+        "num_relation_rules": num_relation_rules,
         "test": {
             "mrr": float(mrr),
             "h1": float(h1),
@@ -524,70 +549,54 @@ def aggregate_single(relation):
         },
     }
 
-    logging.info((mrr, mrr_raw))
-    logging.info((h1, h1_raw))
-    logging.info((h10, h10_raw))
-
-    save(head_mrr, args.experiment, f"head_mrr_{pos}_{lr}")
-    save(tail_mrr, args.experiment, f"tail_mrr_{pos}_{lr}")
+    save((compact_mrr_for_save(head_mrr), compact_mrr_for_save(tail_mrr)), args.experiment, f"mrr-{relation}.pkl")
     with open(f"{args.experiment}/metric-{relation}.json", "w") as f:
         json.dump(metrics, f, indent=4)
 
+    with open(f"{args.experiment}/weight-{relation}.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ruleID", "weight"])
+        writer.writerows(learned_weights)
+
     return metrics
 
+args = get_parser().parse_args()
+args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"
+args.directory_preprocessed_datasets = f"./{args.dataset}/datasets/"
+time = datetime.now().strftime("%m%d-%H%M")
+args.experiment = f"./{args.dataset}/exp-{time}"
+
+# Set up experiment folder
+if not os.path.exists(args.experiment):
+    os.makedirs(args.experiment)
+# Copy stuff for reproducibility
+shutil.copy(__file__, args.experiment)
+with open(f"{args.experiment}/config.json", "w") as f:
+    json.dump(vars(args), f, indent=4)
+
+c = kge.Config()
+c.set("dataset.name", args.dataset)
+dataset = kge.Dataset.create(c)
+
+test_sp_to_o = dataset.index("test_sp_to_o")
+test_po_to_s = dataset.index("test_po_to_s")
+test_torch = dataset.split("test")
+
+valid_sp_to_o = dataset.index("valid_sp_to_o")
+valid_po_to_s = dataset.index("valid_po_to_s")
+
+processed_sp_test = pickle.load(open(args.directory_explanations + "processed_sp_test.pkl", "rb"))
+processed_po_test = pickle.load(open(args.directory_explanations + "processed_po_test.pkl", "rb"))
+
+processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_sp_valid.pkl", "rb"))
+processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
+
+rule_map = pickle.load(open(args.directory_explanations + "rule_map.pkl", "rb"))
+rule_features = pickle.load(open(args.directory_explanations + "rule_features.pkl", "rb"))
+
+LEN_RULES = len(rule_features)
+PAD_TOK = LEN_RULES
 
 if __name__ == "__main__":
-    args = get_parser().parse_args()
-    args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"
-    args.directory_preprocessed_datasets = f"./{args.dataset}/datasets/"
-    time = datetime.now().strftime("%m%d-%H%M")
-    args.experiment = f"./{args.dataset}/exp-{time}"
-
-    # Set up experiment folder
-    if not os.path.exists(args.experiment):
-        os.makedirs(args.experiment)
-    # Copy stuff for reproducibility
-    shutil.copy(__file__, args.experiment)
-    with open(f"{args.experiment}/config.json", "w") as f:
-        json.dump(vars(args), f, indent=4)
-    # Set up logger
-    logging.basicConfig(
-        filename=f"{args.experiment}/run.log",
-        filemode="w",
-        level=logging.DEBUG,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        force=True,
-    )
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    logging.getLogger().addHandler(ch)
-    logging.info(f"Starting experiment {args.experiment}")
-    logging.info(pformat(vars(args)))
-
-    c = kge.Config()
-    c.set("dataset.name", args.dataset)
-    dataset = kge.Dataset.create(c)
-
-    test_sp_to_o = dataset.index("test_sp_to_o")
-    test_po_to_s = dataset.index("test_po_to_s")
-    test_torch = dataset.split("test")
-
-    valid_sp_to_o = dataset.index("valid_sp_to_o")
-    valid_po_to_s = dataset.index("valid_po_to_s")
-
-    processed_sp_test = pickle.load(open(args.directory_explanations + "processed_sp_test.pkl", "rb"))
-    processed_po_test = pickle.load(open(args.directory_explanations + "processed_po_test.pkl", "rb"))
-
-    processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_sp_valid.pkl", "rb"))
-    processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
-
-    rule_map = pickle.load(open(args.directory_explanations + "rule_map.pkl", "rb"))
-    rule_features = pickle.load(open(args.directory_explanations + "rule_features.pkl", "rb"))
-
-    LEN_RULES = len(rule_features)
-    PAD_TOK = LEN_RULES
-
     metrics = aggregate_single(args.relation)
-    logging.info(pformat(metrics))
-
-    logging.info("Done")
+    print(pformat(metrics))
