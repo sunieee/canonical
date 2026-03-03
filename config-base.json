@@ -2,7 +2,6 @@
     "device": "cuda",
     "max_worker_dataloader": 3,
     "max_worker_mrr": 3,
-    "model": "LinearAggregator",
     "shuffle_train": false,
     "batch_size": 4096,
     "sign_constraint": false,
