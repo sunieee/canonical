@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 import argparse
+from collections import defaultdict
+from contextlib import contextmanager
 import csv
 import copy
 import ctypes
@@ -15,10 +17,10 @@ import warnings
 from datetime import datetime
 from os.path import exists
 from pprint import pformat
+from time import perf_counter
 
 import kge
 import numpy as np
-import scipy
 import torch
 from torch import multiprocessing as mp
 from torch import nn
@@ -27,6 +29,53 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 torch.multiprocessing.set_sharing_strategy("file_system")
+
+
+STEP_TIMINGS = defaultdict(float)
+STEP_COUNTS = defaultdict(int)
+STEP_GPU_REQUIRED = {
+    "load_dataloaders": False,
+    "epoch_train.batch_regularization": True,
+    "epoch_train.batch_to_device": False,
+    "epoch_train.batch_forward_backward": True,
+    "epoch_train": True,
+    "epoch_model_to_cpu": False,
+    "epoch_eval_head": False,
+    "epoch_eval_tail": False,
+    "epoch_model_to_device": False,
+    "epoch_eval.rank_prepare_tensors": False,
+    "epoch_eval.rank_model_infer": True,
+    "epoch_eval.rank_rankcalc": False,
+    "save_outputs": False,
+}
+
+
+@contextmanager
+def step_timer(step_name):
+    start = perf_counter()
+    try:
+        yield
+    finally:
+        STEP_TIMINGS[step_name] += perf_counter() - start
+        STEP_COUNTS[step_name] += 1
+
+
+def print_step_profile():
+    if len(STEP_TIMINGS) == 0:
+        return
+
+    total = sum([v for k, v in STEP_TIMINGS.items() if '.' not in k])
+    print("\n===== Step Timing Summary =====")
+    print("step_name,total_seconds,calls,avg_seconds,gpu_required")
+
+    for step_name, seconds in sorted(STEP_TIMINGS.items(), key=lambda x: x[1], reverse=True):
+        calls = STEP_COUNTS[step_name]
+        avg = seconds / max(calls, 1)
+        gpu_required = STEP_GPU_REQUIRED.get(step_name, "unknown")
+        print(f"{step_name},{seconds:.6f},{calls},{avg:.6f},{gpu_required}")
+
+    print(f"TOTAL_PROFILED_SECONDS,{total:.6f}")
+    print("===== End Step Timing Summary =====\n")
 
 
 def save(obj, folder, name=None, override=False):
@@ -66,25 +115,29 @@ def train(dataloader, model, loss_fn, optimizer, reg=False, num_unseen=0):
             if num_unseen > num_batches:
                 num_unseen = num_batches
             if i % int(num_batches / num_unseen) == 0:
-                rule_confs = torch.nn.functional.sigmoid(model.rules.weight)
-                sudo_false = torch.zeros_like(rule_confs)
-                loss = loss_fn(rule_confs, sudo_false) / dataloader.batch_size
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                with step_timer("epoch_train.batch_regularization"):
+                    rule_confs = torch.nn.functional.sigmoid(model.rules.weight)
+                    sudo_false = torch.zeros_like(rule_confs)
+                    loss = loss_fn(rule_confs, sudo_false) / dataloader.batch_size
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
         # Compute prediction error
 
-        rules = rules.long().to(args.device)
-        y = y.to(args.device)
-        pred = model(rules)
-        loss = loss_fn(pred.reshape(-1, 1), y)
+        with step_timer("epoch_train.batch_to_device"):
+            rules = rules.long().to(args.device)
+            y = y.to(args.device)
 
-        train_loss += loss.item()
-        n_loss += 1
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        with step_timer("epoch_train.batch_forward_backward"):
+            pred = model(rules)
+            loss = loss_fn(pred.reshape(-1, 1), y)
+
+            train_loss += loss.item()
+            n_loss += 1
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
     return train_loss / n_loss
 
@@ -111,16 +164,6 @@ def test(dataloader, model, loss_fn):
     return test_loss
 
 
-def get_conf(x):
-    if x == PAD_TOK:
-        return 0.0
-    rule = rule_features[x]
-    return int(rule[1]) / (int(rule[0]) + 5)
-
-
-get_conf = np.vectorize(get_conf, otypes=[float])
-
-
 def rank_batch(nnm, golds, candidates, rules, test_filter):
 
     batch_rank, batch_rank_raw = [], []
@@ -129,18 +172,22 @@ def rank_batch(nnm, golds, candidates, rules, test_filter):
         scores = torch.full((dataset.num_entities(),), fill_value)
         scores_raw = torch.full((dataset.num_entities(),), fill_value)
 
-        rules_ = torch.nested.to_padded_tensor(
-            torch.nested.nested_tensor([torch.tensor(x) for x in rules]), padding=PAD_TOK
-        ).long()
+        # 这里的 rules 已经在 get_ranks() 中预先构造成 padded tensor 并缓存，
+        # 避免在每个 epoch / 每个 key 的 rank_batch 中重复构造。
+        rules_ = rules
         if rules_.numel() == 0:
             return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
 
-        with torch.no_grad():
-            pred = nnm(rules_).detach()
-            if args.model != "NoisyOrAggregator":
-                pred = torch.sigmoid(pred).detach()
+        with step_timer("epoch_eval.rank_model_infer"):
+            with torch.no_grad():
+                pred = nnm(rules_).detach()
+                if args.model != "NoisyOrAggregator":
+                    pred = torch.sigmoid(pred).detach()
 
-        max_conf = get_conf(rules_.cpu()).max(axis=1).reshape(-1, 1).astype(np.float32)
+        # 优化点：用张量查表替代 np.vectorize(get_conf) + cpu/numpy 往返。
+        # RULE_CONF_TABLE[rule_id] 直接给出该 rule 的 confidence，PAD_TOK 对应 0。
+        # 这样可把每次 eval 的规则置信度计算下沉到纯 torch 张量运算，减少 Python/NumPy 开销。
+        max_conf = RULE_CONF_TABLE[rules_].max(dim=1, keepdim=True).values
 
         scores[candidates] = (pred * max_conf).squeeze(dim=1)
         scores_raw[candidates] = pred.squeeze(dim=1)
@@ -155,8 +202,17 @@ def rank_batch(nnm, golds, candidates, rules, test_filter):
             for ix, gold in enumerate(golds):
                 gold = gold.item()
                 scores[gold] = gold_scores[ix]
-                ranking = scipy.stats.rankdata(scores.detach().numpy())  # .detach().numpy()
-                batch_rank.append(ranking[gold])
+                # 优化点：只计算当前 gold 的 rank，而不是每次对全实体做 scipy.rankdata 全量排名。
+                # 这里用计数法复现 rankdata(method="average") 的排名定义：
+                # rank = #(score < gold_score) + ( #(score == gold_score) + 1 ) / 2
+                # 复杂度从“每个 gold 做一次全量排序”降到“每个 gold 做一次线性计数比较”，
+                # 可显著降低 eval 的 CPU 时间。
+                with step_timer("epoch_eval.rank_rankcalc"):
+                    gold_score = scores[gold]
+                    n_less = (scores < gold_score).sum().item()
+                    n_equal = (scores == gold_score).sum().item()
+                    rank = n_less + (n_equal + 1) / 2.0
+                batch_rank.append(rank)
                 scores[gold] = fill_value
             return batch_rank
 
@@ -166,14 +222,23 @@ def rank_batch(nnm, golds, candidates, rules, test_filter):
     return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
 
 
+def build_relation_key_index(index_dict, direction="o"):
+    relation_to_keys = defaultdict(list)
+    if direction == "o":
+        for key in index_dict.keys():
+            relation_to_keys[key[1]].append(key)
+    else:
+        for key in index_dict.keys():
+            relation_to_keys[key[0]].append(key)
+    return relation_to_keys
+
+
 def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=False):
     nnm.eval()
-    if direction == "o":
-        # sp
-        keys = [key for key in sp_to_o.keys() if key[1] == relation]
-    else:
-        # po
-        keys = [key for key in sp_to_o.keys() if key[0] == relation]
+    # 优化点：直接使用全局 relation_keys 索引，避免每次 get_ranks 线性扫描所有 keys。
+    split_name = "valid" if filter_test else "test"
+    direction_name = "o" if direction == "o" else "s"
+    keys = relation_keys[f"{split_name}_{direction_name}"].get(relation, [])
 
     if len(keys) == 0:
         return torch.tensor([]), torch.tensor([]), 0
@@ -191,10 +256,25 @@ def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=Fals
 
         golds = sp_to_o[key].long()
         candidates = []
-        rules = []
+        rules = torch.empty((0, 0), dtype=torch.long)
         if key in processed:
             candidates = processed[key]["candidates"]
-            rules = processed[key]["rules"]
+
+            # 优化点：对每个 key 的规则列表只做一次 nested->padded 构造并缓存。
+            # 原实现会在 rank_batch() 中每次 eval 都重复执行：
+            # [torch.tensor(x) for x in rules] + nested_tensor + to_padded_tensor
+            # 这是典型 CPU 热点。缓存后后续 epoch 直接复用张量，显著降低 rank_prepare_tensors 时间。
+            if "rules_padded_tensor" not in processed[key]:
+                with step_timer("epoch_eval.rank_prepare_tensors"):
+                    rule_lists = processed[key]["rules"]
+                    if len(rule_lists) > 0:
+                        processed[key]["rules_padded_tensor"] = torch.nested.to_padded_tensor(
+                            torch.nested.nested_tensor([torch.tensor(x) for x in rule_lists]), padding=PAD_TOK
+                        ).long()
+                    else:
+                        processed[key]["rules_padded_tensor"] = torch.empty((0, 0), dtype=torch.long)
+
+            rules = processed[key]["rules_padded_tensor"]
         data.append((nnm, golds, candidates, rules, test_filter))
 
     data = itertools.starmap(rank_batch, data)
@@ -206,7 +286,7 @@ class LinearAggregator(nn.Module):
     def init_weights(self):
         with torch.no_grad():
             torch.manual_seed(0)
-            confs = torch.from_numpy(get_conf(self.relation_rule_ids)).reshape(-1, 1).float()
+            confs = RULE_CONF_TABLE[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
             self.rules.weight[: self.num_relation_rules] = confs
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
@@ -248,7 +328,7 @@ class NoisyOrAggregator(nn.Module):
     def init_weights(self):
         with torch.no_grad():
             torch.manual_seed(0)
-            confs = torch.from_numpy(get_conf(self.relation_rule_ids)).reshape(-1, 1).float()
+            confs = RULE_CONF_TABLE[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
             confs = confs.clamp(min=1e-6, max=1 - 1e-6)
             logit_values = torch.log(confs / (1 - confs))
             self.rules.weight[: self.num_relation_rules] = logit_values.float()
@@ -406,19 +486,19 @@ class SharedDataset(Dataset):
 
 
 def load_dataloaders(dataset_directory, relation):
+    with step_timer("load_dataloaders"):
+        train_set, _, _ = load(dataset_directory, f"dataset_{relation}.p")
 
-    train_set, _, _ = load(dataset_directory, f"dataset_{relation}.p")
-
-    train_set = SharedDataset(
-        torch.vstack((train_set.datasets[0].tensors[3], train_set.datasets[1].tensors[3])),
-        torch.vstack((train_set.datasets[0].tensors[4], train_set.datasets[1].tensors[4])),
-    )
-    if len(train_set) == 0:
-        return None
-    train_dataloader = DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=args.shuffle_train, num_workers=args.max_worker_dataloader
-    )
-    return train_dataloader
+        train_set = SharedDataset(
+            torch.vstack((train_set.datasets[0].tensors[3], train_set.datasets[1].tensors[3])),
+            torch.vstack((train_set.datasets[0].tensors[4], train_set.datasets[1].tensors[4])),
+        )
+        if len(train_set) == 0:
+            return None
+        train_dataloader = DataLoader(
+            train_set, batch_size=args.batch_size, shuffle=args.shuffle_train, num_workers=args.max_worker_dataloader
+        )
+        return train_dataloader
 
 
 def get_parser():
@@ -507,11 +587,16 @@ def aggregate_single(relation):
 
     pbar = tqdm(range(max_epoch), desc=f"r{relation}", leave=False)
     for t in pbar:
-        loss = train(train_dataloader, nnm, loss_fn, optimizer, args.noisy_or_reg, unseen)
-        nnm.cpu()
-        head_mrr.update(nnm, (pos, lr, t))
-        tail_mrr.update(nnm, (pos, lr, t))
-        nnm.to(args.device)
+        with step_timer("epoch_train"):
+            loss = train(train_dataloader, nnm, loss_fn, optimizer, args.noisy_or_reg, unseen)
+        with step_timer("epoch_model_to_cpu"):
+            nnm.cpu()
+        with step_timer("epoch_eval_head"):
+            head_mrr.update(nnm, (pos, lr, t))
+        with step_timer("epoch_eval_tail"):
+            tail_mrr.update(nnm, (pos, lr, t))
+        with step_timer("epoch_model_to_device"):
+            nnm.to(args.device)
         max_tail_mrr = tail_mrr.maximums_t_raw
         max_head_mrr = head_mrr.maximums_t_raw
         max_mrr = (max_tail_mrr + max_head_mrr) / 2
@@ -549,14 +634,15 @@ def aggregate_single(relation):
         },
     }
 
-    save((compact_mrr_for_save(head_mrr), compact_mrr_for_save(tail_mrr)), args.experiment, f"mrr-{relation}.pkl")
-    with open(f"{args.experiment}/metric-{relation}.json", "w") as f:
-        json.dump(metrics, f, indent=4)
+    with step_timer("save_outputs"):
+        save((compact_mrr_for_save(head_mrr), compact_mrr_for_save(tail_mrr)), args.experiment, f"mrr-{relation}.pkl")
+        with open(f"{args.experiment}/metric-{relation}.json", "w") as f:
+            json.dump(metrics, f, indent=4)
 
-    with open(f"{args.experiment}/weight-{relation}.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["ruleID", "weight"])
-        writer.writerows(learned_weights)
+        with open(f"{args.experiment}/weight-{relation}.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["ruleID", "weight"])
+            writer.writerows(learned_weights)
 
     return metrics
 
@@ -597,6 +683,25 @@ rule_features = pickle.load(open(args.directory_explanations + "rule_features.pk
 LEN_RULES = len(rule_features)
 PAD_TOK = LEN_RULES
 
+# 优化点：预构建规则置信度查表，替代 eval 阶段的 np.vectorize(get_conf) 重复计算。
+# 约定最后一个位置 PAD_TOK 的置信度为 0。
+rule_conf_values = [0.0] * LEN_RULES
+for rule_id in range(LEN_RULES):
+    # rule_features 可能是 dict（遍历时返回 key:int），因此这里按 id 索引取值，
+    # 避免出现“int object is not subscriptable”。
+    rule = rule_features[rule_id]
+    rule_conf_values[rule_id] = int(rule[1]) / (int(rule[0]) + 5)
+RULE_CONF_TABLE = torch.tensor(rule_conf_values + [0.0], dtype=torch.float32)
+
+# 优化点：预构建 relation -> keys 索引，避免每次 get_ranks 线性扫描所有 keys。
+relation_keys = {
+    "valid_o": build_relation_key_index(valid_sp_to_o, direction="o"),
+    "valid_s": build_relation_key_index(valid_po_to_s, direction="s"),
+    "test_o": build_relation_key_index(test_sp_to_o, direction="o"),
+    "test_s": build_relation_key_index(test_po_to_s, direction="s"),
+}
+
 if __name__ == "__main__":
     metrics = aggregate_single(args.relation)
     print(pformat(metrics))
+    print_step_profile()
