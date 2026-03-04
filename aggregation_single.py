@@ -438,10 +438,10 @@ def get_parser():
         default="LinearAggregator",
     )
     parser.add_argument("--shuffle_train", action="store_true", help="Shuffles the examples before creating batches")
-    parser.add_argument("--batch_size", action="store", help="Size of batch", default=4096)
-    parser.add_argument("--lr", action="store", default=0.001, help="Learning rates of the adam optimizer")
-    parser.add_argument("--max_epoch", action="store", default=10, help="Epochs to run for each learning rate")
-    parser.add_argument("--pos", action="store", default=15, help="Scaling of the loss for positive examples")
+    parser.add_argument("--batch_size", action="store", help="Size of batch", default=4096, type=int)
+    parser.add_argument("--lr", action="store", default=0.001, help="Learning rates of the adam optimizer", type=float)
+    parser.add_argument("--max_epoch", action="store", default=10, help="Epochs to run for each learning rate", type=int)
+    parser.add_argument("--pos", action="store", default=15, help="Scaling of the loss for positive examples", type=int)
     parser.add_argument(
         "--sign_constraint",
         action="store_true",
