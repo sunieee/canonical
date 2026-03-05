@@ -16,10 +16,11 @@ def save(obj, folder, name):
     return name
 
 
-def get_dataset(sp_to_o, processed_sp, relation, direction="o"):
+def build_compact_split(sp_to_o, processed_sp, relation, direction="o"):
+    rules_flat = []
+    offsets = [0]
+    golds = []
 
-    idx_keys_map = dict()
-    idx = 0
     for key in sp_to_o.keys():
         if direction == "o":
             e, r = key
@@ -28,61 +29,73 @@ def get_dataset(sp_to_o, processed_sp, relation, direction="o"):
 
         if r != relation and relation != -1:
             continue
-        if key in processed_sp:
-            for ix, candidate in enumerate(processed_sp[key]["candidates"]):
-                if len(processed_sp[key]["rules"][ix]) > 0:
-                    idx_keys_map[idx] = (e, r, ix)
-                    idx += 1
-        else:
-            idx_keys_map[idx] = None
-            idx += 1
+        if key not in processed_sp:
+            continue
 
-    len_ = len(idx_keys_map)
-    test = torch.full((len_, 200), PAD_TOK)
-    golds = torch.zeros((len_, 1))
-    hs = torch.empty((len_, 1))
-    rs = torch.empty((len_, 1))
-    ts = torch.empty((len_, 1))
+        candidates = processed_sp[key]["candidates"]
+        rules_per_candidate = processed_sp[key]["rules"]
+        for ix, prediction in enumerate(candidates):
+            rule_ids = rules_per_candidate[ix]
+            if len(rule_ids) == 0:
+                continue
+            rules_flat.extend(rule_ids)
+            offsets.append(len(rules_flat))
+            golds.append(int(prediction in sp_to_o[key]))
 
-    for idx in range(len_):
-        (e, r, ix) = idx_keys_map[idx]
+    rules_flat_t = torch.tensor(rules_flat, dtype=torch.int32)
+    offsets_t = torch.tensor(offsets, dtype=torch.int64)
+    golds_t = torch.tensor(golds, dtype=torch.float32).reshape(-1, 1)
 
-        key = (e, r) if direction == "o" else (r, e)
+    return {
+        "rules_flat": rules_flat_t,
+        "offsets": offsets_t,
+        "golds": golds_t,
+        "num_samples": int(golds_t.shape[0]),
+    }
 
-        prediction = processed_sp[key]["candidates"][ix]
-        rules = torch.tensor(processed_sp[key]["rules"][ix])
-        assert len(rules) <= 200
-        assert len(rules) > 0
 
-        if direction == "o":
-            hs[idx, 0] = e
-            ts[idx, 0] = prediction
-        else:
-            hs[idx, 0] = prediction
-            ts[idx, 0] = e
+def concat_compact_splits(split_a, split_b):
+    if split_a["num_samples"] == 0:
+        return split_b
+    if split_b["num_samples"] == 0:
+        return split_a
 
-        rs[idx, 0] = r
-        test[idx, : len(rules)] = rules
-        golds[idx, 0] = int(prediction in sp_to_o[key])
+    rules_flat = torch.cat([split_a["rules_flat"], split_b["rules_flat"]], dim=0)
+    offsets_b_shifted = split_b["offsets"][1:] + split_a["rules_flat"].shape[0]
+    offsets = torch.cat([split_a["offsets"], offsets_b_shifted], dim=0)
+    golds = torch.cat([split_a["golds"], split_b["golds"]], dim=0)
 
-    return torch.utils.data.TensorDataset(hs, rs, ts, test, golds)
+    return {
+        "rules_flat": rules_flat,
+        "offsets": offsets,
+        "golds": golds,
+        "num_samples": int(golds.shape[0]),
+    }
 
 
 def generate_dataset(relation):
+    train_set_o = build_compact_split(train_sp_to_o, processed_sp_train, relation)
+    train_set_s = build_compact_split(train_po_to_s, processed_po_train, relation, direction="s")
+    valid_set_o = build_compact_split(valid_sp_to_o, processed_sp_valid, relation)
+    valid_set_s = build_compact_split(valid_po_to_s, processed_po_valid, relation, direction="s")
+    test_set_o = build_compact_split(test_sp_to_o, processed_sp_test, relation)
+    test_set_s = build_compact_split(test_po_to_s, processed_po_test, relation, direction="s")
 
-    train_set_o = get_dataset(train_sp_to_o, processed_sp_train, relation)
-    train_set_s = get_dataset(train_po_to_s, processed_po_train, relation, direction="s")
-    valid_set_o = get_dataset(valid_sp_to_o, processed_sp_valid, relation)
-    valid_set_s = get_dataset(valid_po_to_s, processed_po_valid, relation, direction="s")
-    test_set_o = get_dataset(test_sp_to_o, processed_sp_test, relation)
-    test_set_s = get_dataset(test_po_to_s, processed_po_test, relation, direction="s")
+    train_set = concat_compact_splits(train_set_o, train_set_s)
+    valid_set = concat_compact_splits(valid_set_o, valid_set_s)
+    test_set = concat_compact_splits(test_set_o, test_set_s)
 
-    train_set = torch.utils.data.ConcatDataset([train_set_o, train_set_s])
-    test_set = torch.utils.data.ConcatDataset([test_set_o, test_set_s])
-    valid_set = torch.utils.data.ConcatDataset([valid_set_o, valid_set_s])
+    data_obj = {
+        "format": "compact_varlen_int32_v1",
+        "pad_tok": int(PAD_TOK),
+        "num_rules": int(LEN_RULES),
+        "train": train_set,
+        "valid": valid_set,
+        "test": test_set,
+    }
 
     if args["output"] is not None:
-        save((train_set, valid_set, test_set), args["output"], f"dataset_{relation}")
+        save(data_obj, args["output"], f"dataset_{relation}")
 
     return relation
 
@@ -97,8 +110,9 @@ if __name__ == "__main__":
         default="./codex-m/expl/explanations-processed/",
     )
     parser.add_argument("-d", "--dataset", help="Name of the dataset (loaded with libkge)", default="codex-m")
-    parser.add_argument("-o", "--output", help="Folder where datasets are written", default="./codex-m/datasets")
+    # parser.add_argument("-o", "--output", help="Folder where datasets are written", default="./codex-m/datasets")
     args = vars(parser.parse_args())
+    args["output"] = os.path.join(args["dataset"], "datasets")
 
     c = Config()
     c.set("dataset.name", args["dataset"])

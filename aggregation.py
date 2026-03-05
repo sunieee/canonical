@@ -5,7 +5,6 @@ from collections import defaultdict
 from contextlib import contextmanager
 import csv
 import copy
-import ctypes
 import glob
 import itertools
 import json
@@ -25,7 +24,6 @@ import numpy as np
 import torch
 from torch import multiprocessing as mp
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
@@ -36,6 +34,9 @@ STEP_TIMINGS = defaultdict(float)
 STEP_COUNTS = defaultdict(int)
 STEP_GPU_REQUIRED = {
     "load_dataloaders": False,
+    "epoch_train.iter_create": False,
+    "epoch_train.iter_finalize": False,
+    "epoch_train.batch_data_wait": False,
     "epoch_train.batch_regularization": True,
     "epoch_train.batch_to_device": False,
     "epoch_train.batch_forward_backward": True,
@@ -104,11 +105,28 @@ def load(folder, name):
         return None
 
 
+def timed_dataloader_batches(dataloader):
+    with step_timer("epoch_train.iter_create"):
+        data_iter = iter(dataloader)
+
+    try:
+        while True:
+            with step_timer("epoch_train.batch_data_wait"):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    break
+            yield batch
+    finally:
+        with step_timer("epoch_train.iter_finalize"):
+            pass
+
+
 def train(dataloader, model, loss_fn, optimizer, reg=False, num_unseen=0):
     model.train()
     train_loss = 0
     n_loss = 0
-    for i, (rules, y) in enumerate(dataloader):
+    for i, (rules, y) in enumerate(timed_dataloader_batches(dataloader)):
 
         # compute regularization
         if reg and num_unseen > 0:
@@ -462,46 +480,77 @@ def compact_mrr_for_save(mrr_obj):
     return mrr_light
 
 
-class SharedDataset(Dataset):
-    def get_empty_shared_array(self, shape, type_):
-        shared_array_base = mp.Array(type_, torch.tensor(shape).prod().item())
-        shared_array = np.ctypeslib.as_array(shared_array_base.get_obj())
-        shared_array = shared_array.reshape(*shape)
-        return torch.from_numpy(shared_array)
-
-    def __init__(self, xs, ys):
-        self.shared_x = self.get_empty_shared_array(xs.shape, ctypes.c_int)
-        self.shared_x[:] = xs
-        self.shared_y = self.get_empty_shared_array(ys.shape, ctypes.c_float)
-        self.shared_y[:] = ys
-        self.use_cache = False
-        self.len = xs.shape[0]
-
-    def __getitem__(self, index):
-        x = self.shared_x[index]
-        y = self.shared_y[index]
-        return x, y
+class FastTensorBatchLoader:
+    def __init__(self, rules, ys, batch_size, shuffle=False):
+        self.rules = rules.contiguous()
+        self.ys = ys.contiguous()
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.size = int(ys.shape[0])
 
     def __len__(self):
-        return self.len
+        if self.size == 0:
+            return 0
+        return (self.size + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        if self.size == 0:
+            return
+        if self.shuffle:
+            perm = torch.randperm(self.size)
+            for i in range(0, self.size, self.batch_size):
+                idx = perm[i: i + self.batch_size]
+                yield self.rules[idx], self.ys[idx]
+        else:
+            for i in range(0, self.size, self.batch_size):
+                yield self.rules[i: i + self.batch_size], self.ys[i: i + self.batch_size]
+
+
+def materialize_compact_split_to_padded(split_dict):
+    offsets = split_dict["offsets"].long()
+    rules_flat = split_dict["rules_flat"].int()
+    ys = split_dict["golds"].float()
+
+    num_samples = int(ys.shape[0])
+    if num_samples == 0:
+        return torch.empty((0, 0), dtype=torch.int32), ys
+
+    lengths = offsets[1:] - offsets[:-1]
+    max_len = int(lengths.max().item())
+    padded = torch.full((num_samples, max_len), PAD_TOK, dtype=torch.int32)
+
+    for i in range(num_samples):
+        start = int(offsets[i].item())
+        end = int(offsets[i + 1].item())
+        n = end - start
+        if n > 0:
+            padded[i, :n] = rules_flat[start:end]
+
+    return padded, ys
 
 
 def load_dataloaders(dataset_directory, relation):
     with step_timer("load_dataloaders"):
-        train_set, _, _ = load(dataset_directory, f"dataset_{relation}.p")
+        data_obj = load(dataset_directory, f"dataset_{relation}.p")
 
-        train_set = SharedDataset(
-            torch.vstack((train_set.datasets[0].tensors[3], train_set.datasets[1].tensors[3])),
-            torch.vstack((train_set.datasets[0].tensors[4], train_set.datasets[1].tensors[4])),
+        if not (isinstance(data_obj, dict) and data_obj.get("format") == "compact_varlen_int32_v1"):
+            raise ValueError(
+                "dataset format is not compact_varlen_int32_v1. "
+                "Please regenerate dataset_*.p with updated create_datasets.py"
+            )
+
+        train_split = data_obj["train"]
+        rules_padded, ys = materialize_compact_split_to_padded(train_split)
+        train_loader = FastTensorBatchLoader(
+            rules_padded,
+            ys,
+            batch_size=args.batch_size,
+            shuffle=args.shuffle_train,
         )
-        if len(train_set) == 0:
+
+        if len(train_loader) == 0:
             return None
-        train_dataloader = DataLoader(
-            train_set, batch_size=args.batch_size, shuffle=args.shuffle_train, num_workers=args.max_worker_dataloader,
-            persistent_workers=True,  # worker 会在 epoch 之间保持活跃，避免重复的 worker 启动开销。
-            prefetch_factor=4,  # 指定每个 worker 预取多少个 batch。可以根据内存情况调整，默认值是 2。
-        )
-        return train_dataloader
+        return train_loader
 
 
 def get_parser():
@@ -534,9 +583,7 @@ def get_parser():
     parser.add_argument(
         "--noisy_or_reg", action="store_true", help="Sudo negative examples for noisy-or learning.", default=False
     )
-    parser.add_argument(
-        "--num_unseen", action="store_true", help="Num Sudo negative examples for noisy-or learning.", default=0
-    )
+    parser.add_argument("--num_unseen", help="Num Sudo negative examples for noisy-or learning.", default=0, type=int)
     parser.add_argument("--relation", action="store", help="Relation to train on", default=0, type=int)
     parser.add_argument(
         "--multiprocess",
