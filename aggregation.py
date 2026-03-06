@@ -573,7 +573,21 @@ def get_parser():
     parser.add_argument("--shuffle_train", action="store_true", help="Shuffles the examples before creating batches")
     parser.add_argument("--batch_size", action="store", help="Size of batch", default=4096, type=int)
     parser.add_argument("--lr", action="store", default=0.001, help="Learning rates of the adam optimizer", type=float)
-    parser.add_argument("--max_epoch", action="store", default=10, help="Epochs to run for each learning rate", type=int)
+    parser.add_argument("--max_epoch", action="store", default=60, help="Epochs to run for each learning rate", type=int)
+    parser.add_argument(
+        "--evaluate_every",
+        action="store",
+        default=2,
+        type=int,
+        help="Evaluate every X epochs (and always at last epoch).",
+    )
+    parser.add_argument(
+        "--early_stopping",
+        action="store",
+        default=5,
+        type=int,
+        help="Stop if valid metric does not improve for X consecutive evaluations. -1 disables.",
+    )
     parser.add_argument("--pos", action="store", default=15, help="Scaling of the loss for positive examples", type=int)
     parser.add_argument(
         "--sign_constraint",
@@ -616,7 +630,10 @@ def BCELossR(weights=[1, 1], reduction="mean", apply_sigmoid=False):
 
 
 def aggregate_single(relation):
+    relation_start_time = perf_counter()
+    load_start_time = perf_counter()
     dataloader = load_dataloaders(args.directory_preprocessed_datasets, relation)
+    load_seconds = perf_counter() - load_start_time
 
     pos = args.pos
     lr = args.lr
@@ -643,18 +660,46 @@ def aggregate_single(relation):
     elif args.model == "NoisyOrAggregator":
         loss_fn = BCELossR([1, pos])
 
+    evaluate_every = max(int(args.evaluate_every), 1)
+    early_stopping_patience = int(args.early_stopping)
+    best_valid_combined_raw = -1.0
+    no_improve_eval_rounds = 0
+    epochs_trained = 0
+    train_seconds = 0.0
+    eval_seconds = 0.0
+
     pbar = tqdm(range(max_epoch), desc=f"r{relation}", leave=False)
     for t in pbar:
+        epochs_trained = t + 1
+        train_start = perf_counter()
         with step_timer("epoch_train"):
             loss = train(train_dataloader, nnm, loss_fn, optimizer, args.noisy_or_reg, unseen)
-        with step_timer("epoch_model_to_cpu"):
-            nnm.cpu()
-        with step_timer("epoch_eval_head"):
-            head_mrr.update(nnm, (pos, lr, t))
-        with step_timer("epoch_eval_tail"):
-            tail_mrr.update(nnm, (pos, lr, t))
-        with step_timer("epoch_model_to_device"):
-            nnm.to(args.device)
+        train_seconds += perf_counter() - train_start
+
+        do_eval = ((t + 1) % evaluate_every == 0) or (t == max_epoch - 1)
+        if do_eval:
+            eval_start = perf_counter()
+            with step_timer("epoch_model_to_cpu"):
+                nnm.cpu()
+            with step_timer("epoch_eval_head"):
+                head_mrr.update(nnm, (pos, lr, t))
+            with step_timer("epoch_eval_tail"):
+                tail_mrr.update(nnm, (pos, lr, t))
+            with step_timer("epoch_model_to_device"):
+                nnm.to(args.device)
+            eval_seconds += perf_counter() - eval_start
+
+            valid_combined_raw = (head_mrr.maximums_v_raw + tail_mrr.maximums_v_raw) / 2.0
+            if valid_combined_raw > best_valid_combined_raw:
+                best_valid_combined_raw = valid_combined_raw
+                no_improve_eval_rounds = 0
+            else:
+                no_improve_eval_rounds += 1
+
+            if early_stopping_patience > 0 and no_improve_eval_rounds >= early_stopping_patience:
+                pbar.set_postfix(tail_loss=f"{loss:.5f}", max_mrr=f"{((tail_mrr.maximums_t_raw + head_mrr.maximums_t_raw) / 2):.5f}")
+                break
+
         max_tail_mrr = tail_mrr.maximums_t_raw
         max_head_mrr = head_mrr.maximums_t_raw
         max_mrr = (max_tail_mrr + max_head_mrr) / 2
@@ -678,10 +723,37 @@ def aggregate_single(relation):
     num_test_samples = int(test_torch[test_torch[:, 1] == relation].shape[0])
     num_relation_rules = int(len(relation_rule_ids))
 
+    best_valid_mrr, best_valid_mrr_raw = calc_mrr(tail_mrr, head_mrr, "maximums_v")
+    relation_total_seconds = perf_counter() - relation_start_time
+    other_seconds = relation_total_seconds - load_seconds - train_seconds - eval_seconds
+    if other_seconds < 0:
+        other_seconds = 0.0
+
     metrics = {
         "relation": int(relation),
         "num_test_samples": num_test_samples,
         "num_relation_rules": num_relation_rules,
+        "train": {
+            "max_epoch": int(max_epoch),
+            "epochs_trained": int(epochs_trained),
+            "evaluate_every": int(evaluate_every),
+        },
+        "time_seconds": {
+            "total": float(relation_total_seconds),
+            "load_dataloaders": float(load_seconds),
+            "train": float(train_seconds),
+            "eval": float(eval_seconds),
+            "other": float(other_seconds),
+        },
+        "best_valid": {
+            "mrr": float(best_valid_mrr),
+            "mrr_raw": float(best_valid_mrr_raw),
+            "head_mrr": float(head_mrr.maximums_v),
+            "tail_mrr": float(tail_mrr.maximums_v),
+            "head_mrr_raw": float(head_mrr.maximums_v_raw),
+            "tail_mrr_raw": float(tail_mrr.maximums_v_raw),
+            "combined_raw": float(best_valid_combined_raw),
+        },
         "test": {
             "mrr": float(mrr),
             "h1": float(h1),
@@ -757,7 +829,42 @@ def _merge_metric_files(metric_files, relation_test_counts):
     }
 
 
+def _finalize_relation_sweep(success_relations, failed_relations, relation_test_counts, sweep_seconds):
+    metric_files = sorted(glob.glob(os.path.join(args.experiment, "metric-*.json")))
+    merged = _merge_metric_files(metric_files, relation_test_counts)
+
+    time_keys = ["total", "load_dataloaders", "train", "eval", "other"]
+    summed_time_seconds = {k: 0.0 for k in time_keys}
+    for path in metric_files:
+        with open(path, "r") as f:
+            m = json.load(f)
+        metric_time = m.get("time_seconds", {})
+        for k in time_keys:
+            summed_time_seconds[k] += float(metric_time.get(k, 0.0))
+
+    summed_time_seconds["sweep"] = float(sweep_seconds)
+
+    final_result = {
+        "experiment": args.experiment,
+        "model": args.model,
+        "dataset": args.dataset,
+        "success_relations": success_relations,
+        "failed_relations": failed_relations,
+        "summary": merged,
+        "time_seconds": summed_time_seconds,
+    }
+
+    out_path = os.path.join(args.experiment, "metrics-final.json")
+    with open(out_path, "w") as f:
+        json.dump(final_result, f, indent=4)
+
+    print(f"Finished relation sweep. success={len(success_relations)}, failed={len(failed_relations)}")
+    print(f"Final summary saved to {out_path}")
+    return final_result
+
+
 def aggregate_all_relations_sequential():
+    sweep_start_time = perf_counter()
     relations = _get_all_relations()
     relation_test_counts = _get_relation_test_counts()
 
@@ -773,25 +880,8 @@ def aggregate_all_relations_sequential():
         except Exception as e:
             failed_relations[int(relation)] = str(e)
 
-    metric_files = sorted(glob.glob(os.path.join(args.experiment, "metric-*.json")))
-    merged = _merge_metric_files(metric_files, relation_test_counts)
-
-    final_result = {
-        "experiment": args.experiment,
-        "model": args.model,
-        "dataset": args.dataset,
-        "success_relations": success_relations,
-        "failed_relations": failed_relations,
-        "summary": merged,
-    }
-
-    out_path = os.path.join(args.experiment, "metrics-final.json")
-    with open(out_path, "w") as f:
-        json.dump(final_result, f, indent=4)
-
-    print(f"Finished relation sweep. success={len(success_relations)}, failed={len(failed_relations)}")
-    print(f"Final summary saved to {out_path}")
-    return final_result
+    sweep_seconds = perf_counter() - sweep_start_time
+    return _finalize_relation_sweep(success_relations, failed_relations, relation_test_counts, sweep_seconds)
 
 
 def _run_one_relation(relation):
@@ -803,6 +893,7 @@ def _run_one_relation(relation):
 
 
 def aggregate_multiple():
+    sweep_start_time = perf_counter()
     # 在多进程 worker 内强制 DataLoader 单进程加载（num_workers=0）
     args.max_worker_dataloader = 0
 
@@ -824,25 +915,8 @@ def aggregate_multiple():
                 except Exception as e:
                     failed_relations[int(relation)] = str(e)
 
-    metric_files = sorted(glob.glob(os.path.join(args.experiment, "metric-*.json")))
-    merged = _merge_metric_files(metric_files, relation_test_counts)
-
-    final_result = {
-        "experiment": args.experiment,
-        "model": args.model,
-        "dataset": args.dataset,
-        "success_relations": success_relations,
-        "failed_relations": failed_relations,
-        "summary": merged,
-    }
-
-    out_path = os.path.join(args.experiment, "metrics-final.json")
-    with open(out_path, "w") as f:
-        json.dump(final_result, f, indent=4)
-
-    print(f"Finished relation sweep. success={len(success_relations)}, failed={len(failed_relations)}")
-    print(f"Final summary saved to {out_path}")
-    return final_result
+    sweep_seconds = perf_counter() - sweep_start_time
+    return _finalize_relation_sweep(success_relations, failed_relations, relation_test_counts, sweep_seconds)
 
 args = get_parser().parse_args()
 args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"

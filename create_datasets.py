@@ -103,15 +103,11 @@ def generate_dataset(relation):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Creates datasets for bce")
-    parser.add_argument(
-        "-e",
-        "--explanation",
-        help="Folder containing processed explanations",
-        default="./codex-m/expl/explanations-processed/",
-    )
+    # parser.add_argument("-e", "--explanation", help="Folder containing processed explanations", default=None)
     parser.add_argument("-d", "--dataset", help="Name of the dataset (loaded with libkge)", default="codex-m")
     # parser.add_argument("-o", "--output", help="Folder where datasets are written", default="./codex-m/datasets")
     args = vars(parser.parse_args())
+    args["explanation"] = os.path.join(args["dataset"], "expl", "explanations-processed")
     args["output"] = os.path.join(args["dataset"], "datasets")
 
     c = Config()
@@ -132,17 +128,17 @@ if __name__ == "__main__":
     valid_po_to_s = dataset.index("valid_po_to_s")
     valid_torch = dataset.split("valid")
 
-    processed_sp_train = pickle.load(open(args["explanation"] + "processed_sp_train.pkl", "rb"))
-    processed_po_train = pickle.load(open(args["explanation"] + "processed_po_train.pkl", "rb"))
+    processed_sp_train = pickle.load(open(os.path.join(args["explanation"], "processed_sp_train.pkl"), "rb"))
+    processed_po_train = pickle.load(open(os.path.join(args["explanation"], "processed_po_train.pkl"), "rb"))
 
-    processed_sp_test = pickle.load(open(args["explanation"] + "processed_sp_test.pkl", "rb"))
-    processed_po_test = pickle.load(open(args["explanation"] + "processed_po_test.pkl", "rb"))
+    processed_sp_test = pickle.load(open(os.path.join(args["explanation"], "processed_sp_test.pkl"), "rb"))
+    processed_po_test = pickle.load(open(os.path.join(args["explanation"], "processed_po_test.pkl"), "rb"))
 
-    processed_sp_valid = pickle.load(open(args["explanation"] + "processed_sp_valid.pkl", "rb"))
-    processed_po_valid = pickle.load(open(args["explanation"] + "processed_po_valid.pkl", "rb"))
+    processed_sp_valid = pickle.load(open(os.path.join(args["explanation"], "processed_sp_valid.pkl"), "rb"))
+    processed_po_valid = pickle.load(open(os.path.join(args["explanation"], "processed_po_valid.pkl"), "rb"))
 
-    rule_map = pickle.load(open(args["explanation"] + "rule_map.pkl", "rb"))
-    rule_features = pickle.load(open(args["explanation"] + "rule_features.pkl", "rb"))
+    rule_map = pickle.load(open(os.path.join(args["explanation"], "rule_map.pkl"), "rb"))
+    rule_features = pickle.load(open(os.path.join(args["explanation"], "rule_features.pkl"), "rb"))
     ruleid2relid = {ruleid: relid for relid in rule_map for ruleid in rule_map[relid]}
 
     filter_test = set([tuple(x.tolist()) for x in test_torch])
@@ -156,3 +152,6 @@ if __name__ == "__main__":
 
     with Pool(processes=num_workers) as pool:
         list(tqdm(pool.imap_unordered(generate_dataset, range(num_relations)), total=num_relations))
+
+    # for relation in tqdm(range(dataset.num_relations())):
+    #     generate_dataset(relation)
