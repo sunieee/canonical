@@ -366,6 +366,8 @@ class LinearAggregator(nn.Module):
         with torch.no_grad():
             torch.manual_seed(0)
             confs = RULE_CONF_TABLE_CPU[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
+            if self.sign_constraint:
+                confs = torch.sqrt(torch.clamp(confs, min=0.0))
             self.rules.weight[: self.num_relation_rules] = confs
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
@@ -654,14 +656,18 @@ def get_parser():
     parser.add_argument(
         "--batch_size", action="store", help="Size of batch", default=4096, type=int
     )
-    parser.add_argument("--lr", action="store", default=0.001, help="Learning rates of the adam optimizer", type=float)
+    parser.add_argument(
+        "--lr",
+        action="store",
+        default="0.01,0.005,0.001",
+        help="Learning rate or comma-separated phase learning rates, e.g. 0.01,0.005,0.001",
+    )
     parser.add_argument("--max_epoch", action="store", default=60, help="Epochs to run for each learning rate", type=int)
     parser.add_argument(
         "--evaluate_every",
         action="store",
-        default=2,
-        type=int,
-        help="Evaluate every X epochs (and always at last epoch).",
+        default="4,2,1",
+        help="Evaluation interval or comma-separated phase intervals, e.g. 4,2,1. Use 0 for no eval in a phase.",
     )
     parser.add_argument(
         "--early_stopping",
@@ -670,12 +676,14 @@ def get_parser():
         type=int,
         help="Stop if valid metric does not improve for X consecutive evaluations. -1 disables.",
     )
-    parser.add_argument("--pos", action="store", default=15, help="Scaling of the loss for positive examples", type=int)
+    parser.add_argument("--pos", action="store", default=5, help="Scaling of the loss for positive examples", type=int)
     parser.add_argument(
-        "--sign_constraint",
-        action="store_true",
-        help="Constrains the rule weights to be >=0. Only implemented for LinearAggregator.",
+        "--no_sign_constraint",
+        dest="sign_constraint",
+        action="store_false",
+        help="Disable sign constraint. By default, sign constraint is enabled for LinearAggregator.",
     )
+    parser.set_defaults(sign_constraint=True)
     parser.add_argument(
         "--noisy_or_reg", action="store_true", help="Sudo negative examples for noisy-or learning.", default=False
     )
@@ -697,6 +705,47 @@ def get_parser():
     )
 
     return parser
+
+
+def parse_csv_schedule(raw_value, cast_fn, name):
+    parts = [p.strip() for p in str(raw_value).split(",") if p.strip() != ""]
+    if len(parts) == 0:
+        raise ValueError(f"{name} must not be empty")
+    try:
+        values = [cast_fn(p) for p in parts]
+    except Exception as e:
+        raise ValueError(f"Invalid {name}: {raw_value}") from e
+    return values
+
+
+def build_phase_lengths(max_epoch, num_phases):
+    max_epoch = int(max_epoch)
+    num_phases = int(num_phases)
+    if max_epoch <= 0:
+        return []
+    if num_phases <= 0:
+        raise ValueError("num_phases must be positive")
+    if num_phases > max_epoch:
+        raise ValueError(f"num_phases ({num_phases}) cannot exceed max_epoch ({max_epoch})")
+
+    if num_phases == 3:
+        return [int(max_epoch * 0.4), int(max_epoch * 0.4), max_epoch - int(max_epoch * 0.8)]
+
+    base = max_epoch // num_phases
+    rem = max_epoch % num_phases
+    return [base + (1 if i < rem else 0) for i in range(num_phases)]
+
+
+def phase_value_for_epoch(epoch_idx, phase_lengths, phase_values):
+    cursor = 0
+    for i, phase_len in enumerate(phase_lengths):
+        next_cursor = cursor + phase_len
+        if epoch_idx < next_cursor:
+            local_epoch = epoch_idx - cursor + 1
+            return i, local_epoch, phase_values[i]
+        cursor = next_cursor
+    i = len(phase_values) - 1
+    return i, phase_lengths[-1], phase_values[i]
 
 
 def BCELossR(weights=[1, 1], reduction="mean", apply_sigmoid=False):
@@ -725,7 +774,9 @@ def aggregate_single(relation):
     load_seconds = perf_counter() - load_start_time
 
     pos = args.pos
-    lr = args.lr
+    lr_values = parse_csv_schedule(args.lr, float, "lr")
+    if any(v <= 0 for v in lr_values):
+        raise ValueError(f"All lr values must be > 0, got {lr_values}")
     max_epoch = args.max_epoch
     unseen = args.num_unseen
     tail_mrr = MRR(relation=relation, direction="o")
@@ -741,7 +792,7 @@ def aggregate_single(relation):
     if nnm.rules.weight.device.type == "cpu":
         raise RuntimeError("GPU-only eval requires CUDA device; please set --device cuda")
 
-    optimizer = torch.optim.Adam(nnm.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(nnm.parameters(), lr=lr_values[0])
     train_dataloader = dataloader
     if train_dataloader is None:
         raise ValueError(f"No training data for relation {relation}")
@@ -751,8 +802,16 @@ def aggregate_single(relation):
     elif args.model == "NoisyOrAggregator":
         loss_fn = BCELossR([1, pos])
 
-    evaluate_every = max(int(args.evaluate_every), 1)
+    eval_every_values = parse_csv_schedule(args.evaluate_every, int, "evaluate_every")
+    if any(v < 0 for v in eval_every_values):
+        raise ValueError(f"All evaluate_every values must be >= 0, got {eval_every_values}")
+
+    lr_phase_lengths = build_phase_lengths(max_epoch, len(lr_values))
+    eval_phase_lengths = build_phase_lengths(max_epoch, len(eval_every_values))
+
+    evaluate_every = eval_every_values[0]
     early_stopping_patience = int(args.early_stopping)
+
     best_valid_combined_raw = -1.0
     no_improve_eval_rounds = 0
     epochs_trained = 0
@@ -762,18 +821,28 @@ def aggregate_single(relation):
     pbar = tqdm(range(max_epoch), desc=f"r{relation}", leave=False)
     for t in pbar:
         epochs_trained = t + 1
+
+        lr_phase_idx, _lr_local_epoch, current_lr = phase_value_for_epoch(t, lr_phase_lengths, lr_values)
+        eval_phase_idx, eval_local_epoch, current_eval_every = phase_value_for_epoch(
+            t, eval_phase_lengths, eval_every_values
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = float(current_lr)
+
         train_start = perf_counter()
         with step_timer("epoch_train"):
             loss = train(train_dataloader, nnm, loss_fn, optimizer, args.noisy_or_reg, unseen)
         train_seconds += perf_counter() - train_start
 
-        do_eval = ((t + 1) % evaluate_every == 0) or (t == max_epoch - 1)
+        do_eval_in_phase = (current_eval_every > 0) and ((eval_local_epoch % int(current_eval_every)) == 0)
+        do_eval = do_eval_in_phase or (t == max_epoch - 1)
+
         if do_eval:
             eval_start = perf_counter()
             with step_timer("epoch_eval_head"):
-                head_mrr.update(nnm, (pos, lr, t))
+                head_mrr.update(nnm, (pos, float(current_lr), t))
             with step_timer("epoch_eval_tail"):
-                tail_mrr.update(nnm, (pos, lr, t))
+                tail_mrr.update(nnm, (pos, float(current_lr), t))
             eval_seconds += perf_counter() - eval_start
 
             valid_combined_raw = (head_mrr.maximums_v_raw + tail_mrr.maximums_v_raw) / 2.0
@@ -787,13 +856,20 @@ def aggregate_single(relation):
                 pbar.set_postfix(
                     tail_loss=f"{loss:.5f}",
                     max_mrr=f"{((tail_mrr.maximums_v_raw + head_mrr.maximums_v_raw) / 2):.5f}",
+                    lr=f"{current_lr:.6g}",
                 )
                 break
 
         max_tail_mrr = tail_mrr.maximums_v_raw
         max_head_mrr = head_mrr.maximums_v_raw
         max_mrr = (max_tail_mrr + max_head_mrr) / 2
-        pbar.set_postfix(tail_loss=f"{loss:.5f}", max_mrr=f"{max_mrr:.5f}")
+        pbar.set_postfix(
+            # phase=f"{lr_phase_idx + 1}/{len(lr_values)}",
+            # eval_every=str(current_eval_every),
+            # lr=f"{current_lr:.6g}",
+            loss=f"{loss:.5f}",
+            max_mrr=f"{max_mrr:.5f}",
+        )
 
     # 训练阶段永远只跑 valid，最后一次性跑 test。
     with step_timer("epoch_eval_head"):
@@ -833,6 +909,11 @@ def aggregate_single(relation):
             "max_epoch": int(max_epoch),
             "epochs_trained": int(epochs_trained),
             "evaluate_every": int(evaluate_every),
+            "lr_schedule": [float(v) for v in lr_values],
+            "lr_phase_epochs": [int(v) for v in lr_phase_lengths],
+            "evaluate_every_schedule": [int(v) for v in eval_every_values],
+            "evaluate_every_phase_epochs": [int(v) for v in eval_phase_lengths],
+            "early_stopping_patience_eval_rounds": int(early_stopping_patience),
         },
         "time_seconds": {
             "total": float(relation_total_seconds),
@@ -1003,7 +1084,7 @@ def aggregate_multiple():
     failed_relations = {}
 
     if relations:
-        with mp.get_context("fork").Pool(processes=num_processes) as pool:
+        with mp.get_context("spawn").Pool(processes=num_processes) as pool:
             results = [pool.apply_async(_run_one_relation, (relation,)) for relation in relations]
             for relation, result in zip(relations, results):
                 try:
@@ -1018,8 +1099,10 @@ args = get_parser().parse_args()
 EVAL_DEVICE = torch.device(args.device)
 args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"
 args.directory_preprocessed_datasets = f"./{args.dataset}/datasets/"
-time = datetime.now().strftime("%m%d-%H%M")
-args.experiment = f"./{args.dataset}/exp-{time}"
+if "EXPERIMENT_DIR" not in os.environ:
+    time = datetime.now().strftime("%m%d-%H%M")
+    os.environ["EXPERIMENT_DIR"] = f"./{args.dataset}/exp-{time}"
+args.experiment = os.environ["EXPERIMENT_DIR"]
 
 # Set up experiment folder
 if not os.path.exists(args.experiment):

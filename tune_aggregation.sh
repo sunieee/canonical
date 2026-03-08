@@ -19,7 +19,7 @@ MAX_WORKER_DATALOADER="${MAX_WORKER_DATALOADER:-$((MAX_PROCESSES>1?MAX_PROCESSES
 POS_WEIGHTS=(5 15 30 100 400)
 LRS=(0.001 0.01)
 EPOCHS=(10 20)
-SIGN_CONSTRAINTS=("" "--sign_constraint")
+SIGN_CONSTRAINTS=("" "--no_sign_constraint")
 
 for pos_weight in "${POS_WEIGHTS[@]}"; do
   for lr in "${LRS[@]}"; do

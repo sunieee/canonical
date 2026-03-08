@@ -4,7 +4,7 @@
     "max_worker_mrr": 3,
     "shuffle_train": false,
     "batch_size": 4096,
-    "sign_constraint": false,
+    "no_sign_constraint": false,
     "noisy_or_reg": false,
     "num_unseen": 0
 }
