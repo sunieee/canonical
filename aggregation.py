@@ -6,7 +6,6 @@ from contextlib import contextmanager
 import csv
 import copy
 import glob
-import itertools
 import json
 import math
 import os
@@ -187,67 +186,6 @@ def test(dataloader, model, loss_fn):
     return test_loss
 
 
-def rank_batch(nnm, golds, candidates, rules, test_filter):
-
-    if len(candidates) == 0 or len(rules) == 0:
-        empty = torch.empty((0,), dtype=torch.float32, device=EVAL_DEVICE)
-        return empty, empty, len(golds)
-
-    model_device = next(nnm.parameters()).device
-    if model_device.type == "cpu":
-        raise RuntimeError("GPU-only eval is enabled, but model is on CPU")
-
-    fill_value = 0.0
-    scores = torch.full((dataset.num_entities(),), fill_value, device=model_device)
-    scores_raw = torch.full((dataset.num_entities(),), fill_value, device=model_device)
-
-    rules_ = rules
-    with step_timer("epoch_eval.rank_model_infer"):
-        with torch.no_grad():
-            pred = nnm(rules_).detach()
-            if args.model != "NoisyOrAggregator":
-                pred = torch.sigmoid(pred).detach()
-
-    max_conf = RULE_CONF_TABLE[rules_].max(dim=1, keepdim=True).values
-
-    candidates_t = candidates
-    golds_t = golds
-    test_filter_t = test_filter
-
-    scores[candidates_t] = (pred * max_conf).squeeze(dim=1)
-    scores_raw[candidates_t] = pred.squeeze(dim=1)
-
-    def get_rank_sorted(scores_tensor):
-        neg_scores = -1.0 * scores_tensor
-        gold_scores = neg_scores[golds_t].clone()
-
-        base_scores = neg_scores.clone()
-        base_scores[golds_t] = fill_value
-        if test_filter_t is not None:
-            base_scores[test_filter_t] = fill_value
-
-        num_golds = int(golds_t.shape[0])
-        if num_golds == 0:
-            return torch.empty((0,), dtype=torch.float32, device=model_device)
-
-        with step_timer("epoch_eval.rank_rankcalc"):
-            sorted_scores = torch.sort(base_scores).values
-            n_less = torch.searchsorted(sorted_scores, gold_scores, right=False).float()
-            n_leq = torch.searchsorted(sorted_scores, gold_scores, right=True).float()
-            n_equal = n_leq - n_less
-
-            fill_t = torch.tensor(fill_value, device=model_device)
-            n_less = n_less - (fill_t < gold_scores).float()
-            n_equal = n_equal + 1.0 - (fill_t == gold_scores).float()
-            ranks = n_less + (n_equal + 1.0) / 2.0
-
-        return ranks
-
-    batch_rank = get_rank_sorted(scores)
-    batch_rank_raw = get_rank_sorted(scores_raw)
-    return batch_rank, batch_rank_raw, len(golds)
-
-
 def _rank_from_scores_tensor(scores_tensor, golds_t, test_filter_t, fill_value=0.0):
     neg_scores = -1.0 * scores_tensor
     gold_scores = neg_scores[golds_t].clone()
@@ -261,10 +199,12 @@ def _rank_from_scores_tensor(scores_tensor, golds_t, test_filter_t, fill_value=0
     if num_golds == 0:
         return torch.empty((0,), dtype=torch.float32, device=scores_tensor.device)
 
-    sorted_scores = torch.sort(base_scores).values
-    n_less = torch.searchsorted(sorted_scores, gold_scores, right=False).float()
-    n_leq = torch.searchsorted(sorted_scores, gold_scores, right=True).float()
-    n_equal = n_leq - n_less
+    # 对每个 gold 直接做比较计数，避免每个 key 的全排序开销。
+    # 这里不做分块：单个 key 下 gold 通常较少，直接一次性计算更简洁。
+    pairwise_cmp = base_scores.unsqueeze(0)
+    gold_scores_col = gold_scores.unsqueeze(1)
+    n_less = (pairwise_cmp < gold_scores_col).sum(dim=1).float()
+    n_equal = (pairwise_cmp == gold_scores_col).sum(dim=1).float()
 
     fill_t = torch.tensor(fill_value, device=scores_tensor.device)
     n_less = n_less - (fill_t < gold_scores).float()
@@ -389,7 +329,7 @@ def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=Fals
             candidates = processed[key]["candidates_tensor_gpu"]
 
             # 优化点：对每个 key 的规则列表只做一次 nested->padded 构造并缓存。
-            # 原实现会在 rank_batch() 中每次 eval 都重复执行：
+            # 否则每次 eval 都会重复执行：
             # [torch.tensor(x) for x in rules] + nested_tensor + to_padded_tensor
             # 这是典型 CPU 热点。缓存后后续 epoch 直接复用张量，显著降低 rank_prepare_tensors 时间。
             if "rules_padded_tensor" not in processed[key]:
@@ -525,8 +465,10 @@ class MRR:
         self.best_hps = None
         self.best_hps_raw = None
 
-        self.maximums_v = 0.0
-        self.maximums_v_raw = 0.0
+        # Use -1 so the first eval checkpoint is always accepted,
+        # even when metric values can be exactly 0.
+        self.maximums_v = -1.0
+        self.maximums_v_raw = -1.0
 
         self.maximums_t = 0.0
         self.maximums_t_raw = 0.0
@@ -561,25 +503,33 @@ class MRR:
         (v_mrr, v_h1, v_h10, v_mrr_raw, v_h1_raw, v_h10_raw) = self.calc_metrics(
             nnm, self.valid_sp_to_o, self.valid_processed, direction=self.direction, filter_test=True
         )
-        if (v_mrr > self.maximums_v) or (v_mrr_raw > self.maximums_v_raw):
-            (t_mrr, t_h1, t_h10, t_mrr_raw, t_h1_raw, t_h10_raw) = self.calc_metrics(
-                nnm, self.test_sp_to_o, self.test_processed, direction=self.direction
-            )
-            if v_mrr > self.maximums_v:
-                self.maximums_v = v_mrr
-                self.maximums_t = t_mrr
-                self.maximums_t_1 = t_h1
-                self.maximums_t_10 = t_h10
-                self.nnm = copy.deepcopy(nnm)
-                self.best_hps = hps
+        if v_mrr > self.maximums_v:
+            self.maximums_v = v_mrr
+            self.nnm = copy.deepcopy(nnm)
+            self.best_hps = hps
 
-            if v_mrr_raw > self.maximums_v_raw:
-                self.maximums_v_raw = v_mrr_raw
-                self.maximums_t_raw = t_mrr_raw
-                self.maximums_t_1_raw = t_h1_raw
-                self.maximums_t_10_raw = t_h10_raw
-                self.nnm_raw = copy.deepcopy(nnm)
-                self.best_hps_raw = hps
+        if v_mrr_raw > self.maximums_v_raw:
+            self.maximums_v_raw = v_mrr_raw
+            self.nnm_raw = copy.deepcopy(nnm)
+            self.best_hps_raw = hps
+
+    def finalize_test(self):
+        # 只在训练结束后对 best-valid checkpoint 跑一次 test，减少评估调用次数。
+        if self.nnm is not None:
+            (t_mrr, t_h1, t_h10, _, _, _) = self.calc_metrics(
+                self.nnm, self.test_sp_to_o, self.test_processed, direction=self.direction
+            )
+            self.maximums_t = t_mrr
+            self.maximums_t_1 = t_h1
+            self.maximums_t_10 = t_h10
+
+        if self.nnm_raw is not None:
+            (_, _, _, t_mrr_raw, t_h1_raw, t_h10_raw) = self.calc_metrics(
+                self.nnm_raw, self.test_sp_to_o, self.test_processed, direction=self.direction
+            )
+            self.maximums_t_raw = t_mrr_raw
+            self.maximums_t_1_raw = t_h1_raw
+            self.maximums_t_10_raw = t_h10_raw
 
 
 def compact_mrr_for_save(mrr_obj):
@@ -669,14 +619,13 @@ def load_dataloaders(dataset_directory, relation):
         train_split = data_obj["train"]
         rules_padded, ys = materialize_compact_split_to_padded(train_split)
 
-        preload_train_to_device = args.device != "cpu" and (not args.no_preload_train_to_device)
         train_loader = FastTensorBatchLoader(
             rules_padded,
             ys,
             batch_size=args.batch_size,
             shuffle=args.shuffle_train,
             device=args.device,
-            preload_to_device=preload_train_to_device,
+            preload_to_device=args.device != "cpu",
         )
 
         if len(train_loader) == 0:
@@ -703,11 +652,8 @@ def get_parser():
     )
     parser.add_argument("--shuffle_train", action="store_true", help="Shuffles the examples before creating batches")
     parser.add_argument(
-        "--no_preload_train_to_device",
-        action="store_true",
-        help="Disable one-time preloading of a relation's training tensors to device.",
+        "--batch_size", action="store", help="Size of batch", default=4096, type=int
     )
-    parser.add_argument("--batch_size", action="store", help="Size of batch", default=4096, type=int)
     parser.add_argument("--lr", action="store", default=0.001, help="Learning rates of the adam optimizer", type=float)
     parser.add_argument("--max_epoch", action="store", default=60, help="Epochs to run for each learning rate", type=int)
     parser.add_argument(
@@ -741,13 +687,6 @@ def get_parser():
         help="Number of processes for all-relation run. 0/1 means single-process.",
         default=0,
         type=int,
-    )
-    parser.add_argument(
-        "--rank_compare_chunk_size",
-        action="store",
-        default=8192,
-        type=int,
-        help="Chunk size along entity dimension for GPU rank counting.",
     )
     parser.add_argument(
         "--eval_key_batch_size",
@@ -845,13 +784,22 @@ def aggregate_single(relation):
                 no_improve_eval_rounds += 1
 
             if early_stopping_patience > 0 and no_improve_eval_rounds >= early_stopping_patience:
-                pbar.set_postfix(tail_loss=f"{loss:.5f}", max_mrr=f"{((tail_mrr.maximums_t_raw + head_mrr.maximums_t_raw) / 2):.5f}")
+                pbar.set_postfix(
+                    tail_loss=f"{loss:.5f}",
+                    max_mrr=f"{((tail_mrr.maximums_v_raw + head_mrr.maximums_v_raw) / 2):.5f}",
+                )
                 break
 
-        max_tail_mrr = tail_mrr.maximums_t_raw
-        max_head_mrr = head_mrr.maximums_t_raw
+        max_tail_mrr = tail_mrr.maximums_v_raw
+        max_head_mrr = head_mrr.maximums_v_raw
         max_mrr = (max_tail_mrr + max_head_mrr) / 2
         pbar.set_postfix(tail_loss=f"{loss:.5f}", max_mrr=f"{max_mrr:.5f}")
+
+    # 训练阶段永远只跑 valid，最后一次性跑 test。
+    with step_timer("epoch_eval_head"):
+        head_mrr.finalize_test()
+    with step_timer("epoch_eval_tail"):
+        tail_mrr.finalize_test()
 
     mrr, mrr_raw = calc_mrr(tail_mrr, head_mrr)
     h1, h1_raw = calc_mrr(tail_mrr, head_mrr, "maximums_t_1")
