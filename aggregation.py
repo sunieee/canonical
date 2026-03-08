@@ -47,7 +47,7 @@ STEP_GPU_REQUIRED = {
     "epoch_model_to_device": False,
     "epoch_eval.rank_prepare_tensors": False,
     "epoch_eval.rank_model_infer": True,
-    "epoch_eval.rank_rankcalc": False,
+    "epoch_eval.rank_rankcalc": True,
     "save_outputs": False,
 }
 
@@ -144,13 +144,17 @@ def train(dataloader, model, loss_fn, optimizer, reg=False, num_unseen=0):
 
         # Compute prediction error
 
-        with step_timer("epoch_train.batch_to_device"):
-            rules = rules.long().to(args.device)
-            y = y.to(args.device)
+        if getattr(dataloader, "on_device", False):
+            rules_ = rules
+            y_ = y
+        else:
+            with step_timer("epoch_train.batch_to_device"):
+                rules_ = rules.long().to(args.device, non_blocking=True)
+                y_ = y.to(args.device, non_blocking=True)
 
         with step_timer("epoch_train.batch_forward_backward"):
-            pred = model(rules)
-            loss = loss_fn(pred.reshape(-1, 1), y)
+            pred = model(rules_)
+            loss = loss_fn(pred.reshape(-1, 1), y_)
 
             train_loss += loss.item()
             n_loss += 1
@@ -185,60 +189,160 @@ def test(dataloader, model, loss_fn):
 
 def rank_batch(nnm, golds, candidates, rules, test_filter):
 
-    batch_rank, batch_rank_raw = [], []
-    if len(candidates) > 0 and len(rules) > 0:
-        fill_value = 0.0
-        scores = torch.full((dataset.num_entities(),), fill_value)
-        scores_raw = torch.full((dataset.num_entities(),), fill_value)
+    if len(candidates) == 0 or len(rules) == 0:
+        empty = torch.empty((0,), dtype=torch.float32, device=EVAL_DEVICE)
+        return empty, empty, len(golds)
 
-        # 这里的 rules 已经在 get_ranks() 中预先构造成 padded tensor 并缓存，
-        # 避免在每个 epoch / 每个 key 的 rank_batch 中重复构造。
-        rules_ = rules
-        if rules_.numel() == 0:
-            return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
+    model_device = next(nnm.parameters()).device
+    if model_device.type == "cpu":
+        raise RuntimeError("GPU-only eval is enabled, but model is on CPU")
 
-        with step_timer("epoch_eval.rank_model_infer"):
-            with torch.no_grad():
-                pred = nnm(rules_).detach()
-                if args.model != "NoisyOrAggregator":
-                    pred = torch.sigmoid(pred).detach()
+    fill_value = 0.0
+    scores = torch.full((dataset.num_entities(),), fill_value, device=model_device)
+    scores_raw = torch.full((dataset.num_entities(),), fill_value, device=model_device)
 
-        # 优化点：用张量查表替代 np.vectorize(get_conf) + cpu/numpy 往返。
-        # RULE_CONF_TABLE[rule_id] 直接给出该 rule 的 confidence，PAD_TOK 对应 0。
-        # 这样可把每次 eval 的规则置信度计算下沉到纯 torch 张量运算，减少 Python/NumPy 开销。
-        max_conf = RULE_CONF_TABLE[rules_].max(dim=1, keepdim=True).values
+    rules_ = rules
+    with step_timer("epoch_eval.rank_model_infer"):
+        with torch.no_grad():
+            pred = nnm(rules_).detach()
+            if args.model != "NoisyOrAggregator":
+                pred = torch.sigmoid(pred).detach()
 
-        scores[candidates] = (pred * max_conf).squeeze(dim=1)
-        scores_raw[candidates] = pred.squeeze(dim=1)
+    max_conf = RULE_CONF_TABLE[rules_].max(dim=1, keepdim=True).values
 
-        def get_rank(scores):
-            batch_rank = []
-            scores = -1 * scores
-            gold_scores = scores[golds].clone()
-            scores[golds] = fill_value
-            if test_filter is not None:
-                scores[test_filter] = fill_value
-            for ix, gold in enumerate(golds):
-                gold = gold.item()
-                scores[gold] = gold_scores[ix]
-                # 优化点：只计算当前 gold 的 rank，而不是每次对全实体做 scipy.rankdata 全量排名。
-                # 这里用计数法复现 rankdata(method="average") 的排名定义：
-                # rank = #(score < gold_score) + ( #(score == gold_score) + 1 ) / 2
-                # 复杂度从“每个 gold 做一次全量排序”降到“每个 gold 做一次线性计数比较”，
-                # 可显著降低 eval 的 CPU 时间。
-                with step_timer("epoch_eval.rank_rankcalc"):
-                    gold_score = scores[gold]
-                    n_less = (scores < gold_score).sum().item()
-                    n_equal = (scores == gold_score).sum().item()
-                    rank = n_less + (n_equal + 1) / 2.0
-                batch_rank.append(rank)
-                scores[gold] = fill_value
-            return batch_rank
+    candidates_t = candidates
+    golds_t = golds
+    test_filter_t = test_filter
 
-        batch_rank = get_rank(scores)
-        batch_rank_raw = get_rank(scores_raw)
+    scores[candidates_t] = (pred * max_conf).squeeze(dim=1)
+    scores_raw[candidates_t] = pred.squeeze(dim=1)
 
-    return torch.tensor(batch_rank), torch.tensor(batch_rank_raw), len(golds)
+    def get_rank_sorted(scores_tensor):
+        neg_scores = -1.0 * scores_tensor
+        gold_scores = neg_scores[golds_t].clone()
+
+        base_scores = neg_scores.clone()
+        base_scores[golds_t] = fill_value
+        if test_filter_t is not None:
+            base_scores[test_filter_t] = fill_value
+
+        num_golds = int(golds_t.shape[0])
+        if num_golds == 0:
+            return torch.empty((0,), dtype=torch.float32, device=model_device)
+
+        with step_timer("epoch_eval.rank_rankcalc"):
+            sorted_scores = torch.sort(base_scores).values
+            n_less = torch.searchsorted(sorted_scores, gold_scores, right=False).float()
+            n_leq = torch.searchsorted(sorted_scores, gold_scores, right=True).float()
+            n_equal = n_leq - n_less
+
+            fill_t = torch.tensor(fill_value, device=model_device)
+            n_less = n_less - (fill_t < gold_scores).float()
+            n_equal = n_equal + 1.0 - (fill_t == gold_scores).float()
+            ranks = n_less + (n_equal + 1.0) / 2.0
+
+        return ranks
+
+    batch_rank = get_rank_sorted(scores)
+    batch_rank_raw = get_rank_sorted(scores_raw)
+    return batch_rank, batch_rank_raw, len(golds)
+
+
+def _rank_from_scores_tensor(scores_tensor, golds_t, test_filter_t, fill_value=0.0):
+    neg_scores = -1.0 * scores_tensor
+    gold_scores = neg_scores[golds_t].clone()
+
+    base_scores = neg_scores.clone()
+    base_scores[golds_t] = fill_value
+    if test_filter_t is not None:
+        base_scores[test_filter_t] = fill_value
+
+    num_golds = int(golds_t.shape[0])
+    if num_golds == 0:
+        return torch.empty((0,), dtype=torch.float32, device=scores_tensor.device)
+
+    sorted_scores = torch.sort(base_scores).values
+    n_less = torch.searchsorted(sorted_scores, gold_scores, right=False).float()
+    n_leq = torch.searchsorted(sorted_scores, gold_scores, right=True).float()
+    n_equal = n_leq - n_less
+
+    fill_t = torch.tensor(fill_value, device=scores_tensor.device)
+    n_less = n_less - (fill_t < gold_scores).float()
+    n_equal = n_equal + 1.0 - (fill_t == gold_scores).float()
+    ranks = n_less + (n_equal + 1.0) / 2.0
+    return ranks
+
+
+def rank_batch_group(nnm, batch_items):
+    """
+    batch_items: list of (golds, candidates, rules, test_filter)
+    Returns list of (rank, rank_raw, n)
+    """
+    model_device = next(nnm.parameters()).device
+    if model_device.type == "cpu":
+        raise RuntimeError("GPU-only eval is enabled, but model is on CPU")
+
+    fill_value = 0.0
+    num_entities = dataset.num_entities()
+
+    outputs = [None] * len(batch_items)
+
+    non_empty_positions = []
+    non_empty_rules = []
+    non_empty_candidate_lens = []
+
+    for i, (golds_t, candidates_t, rules_t, _test_filter_t) in enumerate(batch_items):
+        n = len(golds_t)
+        if len(candidates_t) == 0 or len(rules_t) == 0:
+            empty = torch.empty((0,), dtype=torch.float32, device=model_device)
+            outputs[i] = (empty, empty, n)
+            continue
+
+        non_empty_positions.append(i)
+        non_empty_rules.append(rules_t)
+        non_empty_candidate_lens.append(int(candidates_t.shape[0]))
+
+    if len(non_empty_positions) == 0:
+        return outputs
+
+    # Pad rules across keys in this group so we can run one forward pass.
+    max_rule_len = max(int(r.shape[1]) for r in non_empty_rules)
+    padded_rules = []
+    for r in non_empty_rules:
+        if int(r.shape[1]) == max_rule_len:
+            padded_rules.append(r)
+        else:
+            pad_cols = max_rule_len - int(r.shape[1])
+            pad_block = torch.full((int(r.shape[0]), pad_cols), PAD_TOK, dtype=r.dtype, device=r.device)
+            padded_rules.append(torch.cat([r, pad_block], dim=1))
+    rules_all = torch.cat(padded_rules, dim=0)
+
+    with step_timer("epoch_eval.rank_model_infer"):
+        with torch.no_grad():
+            pred_all = nnm(rules_all).detach()
+            if args.model != "NoisyOrAggregator":
+                pred_all = torch.sigmoid(pred_all).detach()
+    max_conf_all = RULE_CONF_TABLE[rules_all].max(dim=1, keepdim=True).values
+    score_all = (pred_all * max_conf_all).squeeze(dim=1)
+    score_raw_all = pred_all.squeeze(dim=1)
+
+    score_chunks = torch.split(score_all, non_empty_candidate_lens, dim=0)
+    score_raw_chunks = torch.split(score_raw_all, non_empty_candidate_lens, dim=0)
+
+    with step_timer("epoch_eval.rank_rankcalc"):
+        for chunk_ix, pos in enumerate(non_empty_positions):
+            golds_t, candidates_t, _rules_t, test_filter_t = batch_items[pos]
+            scores = torch.full((num_entities,), fill_value, device=model_device)
+            scores_raw = torch.full((num_entities,), fill_value, device=model_device)
+
+            scores[candidates_t] = score_chunks[chunk_ix]
+            scores_raw[candidates_t] = score_raw_chunks[chunk_ix]
+
+            rank = _rank_from_scores_tensor(scores, golds_t, test_filter_t, fill_value=fill_value)
+            rank_raw = _rank_from_scores_tensor(scores_raw, golds_t, test_filter_t, fill_value=fill_value)
+            outputs[pos] = (rank, rank_raw, len(golds_t))
+
+    return outputs
 
 
 def build_relation_key_index(index_dict, direction="o"):
@@ -260,7 +364,8 @@ def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=Fals
     keys = relation_keys[f"{split_name}_{direction_name}"].get(relation, [])
 
     if len(keys) == 0:
-        return torch.tensor([]), torch.tensor([]), 0
+        empty = torch.empty((0,), dtype=torch.float32, device=EVAL_DEVICE)
+        return empty, empty, 0
 
     data = []
     for key in keys:
@@ -268,16 +373,20 @@ def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=Fals
         if filter_test:
             if direction == "o":
                 if key in test_sp_to_o.keys():
-                    test_filter = test_sp_to_o[key].long()
+                    test_filter = test_sp_to_o[key].long().to(EVAL_DEVICE, non_blocking=True)
             else:
                 if key in test_po_to_s.keys():
-                    test_filter = test_po_to_s[key].long()
+                    test_filter = test_po_to_s[key].long().to(EVAL_DEVICE, non_blocking=True)
 
-        golds = sp_to_o[key].long()
-        candidates = []
-        rules = torch.empty((0, 0), dtype=torch.long)
+        golds = sp_to_o[key].long().to(EVAL_DEVICE, non_blocking=True)
+        candidates = torch.empty((0,), dtype=torch.long, device=EVAL_DEVICE)
+        rules = torch.empty((0, 0), dtype=torch.long, device=EVAL_DEVICE)
         if key in processed:
-            candidates = processed[key]["candidates"]
+            if "candidates_tensor_gpu" not in processed[key]:
+                processed[key]["candidates_tensor_gpu"] = torch.as_tensor(
+                    processed[key]["candidates"], dtype=torch.long, device=EVAL_DEVICE
+                )
+            candidates = processed[key]["candidates_tensor_gpu"]
 
             # 优化点：对每个 key 的规则列表只做一次 nested->padded 构造并缓存。
             # 原实现会在 rank_batch() 中每次 eval 都重复执行：
@@ -292,12 +401,23 @@ def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=Fals
                         ).long()
                     else:
                         processed[key]["rules_padded_tensor"] = torch.empty((0, 0), dtype=torch.long)
+            if "rules_padded_tensor_gpu" not in processed[key]:
+                with step_timer("epoch_eval.rank_prepare_tensors"):
+                    processed[key]["rules_padded_tensor_gpu"] = processed[key]["rules_padded_tensor"].to(
+                        EVAL_DEVICE, non_blocking=True
+                    )
 
-            rules = processed[key]["rules_padded_tensor"]
-        data.append((nnm, golds, candidates, rules, test_filter))
+            rules = processed[key]["rules_padded_tensor_gpu"]
+        data.append((golds, candidates, rules, test_filter))
 
-    data = itertools.starmap(rank_batch, data)
-    rank, rank_raw, ns = zip(*data)
+    results = []
+    key_batch_size = max(int(args.eval_key_batch_size), 1)
+    for start in range(0, len(data), key_batch_size):
+        end = min(start + key_batch_size, len(data))
+        group = data[start:end]
+        results.extend(rank_batch_group(nnm, group))
+
+    rank, rank_raw, ns = zip(*results)
     return torch.hstack(rank), torch.hstack(rank_raw), sum(ns)
 
 
@@ -305,7 +425,7 @@ class LinearAggregator(nn.Module):
     def init_weights(self):
         with torch.no_grad():
             torch.manual_seed(0)
-            confs = RULE_CONF_TABLE[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
+            confs = RULE_CONF_TABLE_CPU[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
             self.rules.weight[: self.num_relation_rules] = confs
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
@@ -347,7 +467,7 @@ class NoisyOrAggregator(nn.Module):
     def init_weights(self):
         with torch.no_grad():
             torch.manual_seed(0)
-            confs = RULE_CONF_TABLE[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
+            confs = RULE_CONF_TABLE_CPU[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
             confs = confs.clamp(min=1e-6, max=1 - 1e-6)
             logit_values = torch.log(confs / (1 - confs))
             self.rules.weight[: self.num_relation_rules] = logit_values.float()
@@ -481,12 +601,19 @@ def compact_mrr_for_save(mrr_obj):
 
 
 class FastTensorBatchLoader:
-    def __init__(self, rules, ys, batch_size, shuffle=False):
+    def __init__(self, rules, ys, batch_size, shuffle=False, device=None, preload_to_device=False):
         self.rules = rules.contiguous()
         self.ys = ys.contiguous()
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self.size = int(ys.shape[0])
+        self.on_device = False
+
+        if preload_to_device and device is not None:
+            # 一次性把该 relation 的训练数据搬到设备，避免每个 batch 反复 host->device 拷贝。
+            self.rules = self.rules.long().to(device, non_blocking=True)
+            self.ys = self.ys.to(device, non_blocking=True)
+            self.on_device = True
 
     def __len__(self):
         if self.size == 0:
@@ -541,11 +668,15 @@ def load_dataloaders(dataset_directory, relation):
 
         train_split = data_obj["train"]
         rules_padded, ys = materialize_compact_split_to_padded(train_split)
+
+        preload_train_to_device = args.device != "cpu" and (not args.no_preload_train_to_device)
         train_loader = FastTensorBatchLoader(
             rules_padded,
             ys,
             batch_size=args.batch_size,
             shuffle=args.shuffle_train,
+            device=args.device,
+            preload_to_device=preload_train_to_device,
         )
 
         if len(train_loader) == 0:
@@ -571,6 +702,11 @@ def get_parser():
         default="LinearAggregator",
     )
     parser.add_argument("--shuffle_train", action="store_true", help="Shuffles the examples before creating batches")
+    parser.add_argument(
+        "--no_preload_train_to_device",
+        action="store_true",
+        help="Disable one-time preloading of a relation's training tensors to device.",
+    )
     parser.add_argument("--batch_size", action="store", help="Size of batch", default=4096, type=int)
     parser.add_argument("--lr", action="store", default=0.001, help="Learning rates of the adam optimizer", type=float)
     parser.add_argument("--max_epoch", action="store", default=60, help="Epochs to run for each learning rate", type=int)
@@ -605,6 +741,20 @@ def get_parser():
         help="Number of processes for all-relation run. 0/1 means single-process.",
         default=0,
         type=int,
+    )
+    parser.add_argument(
+        "--rank_compare_chunk_size",
+        action="store",
+        default=8192,
+        type=int,
+        help="Chunk size along entity dimension for GPU rank counting.",
+    )
+    parser.add_argument(
+        "--eval_key_batch_size",
+        action="store",
+        default=64,
+        type=int,
+        help="How many eval keys to group into one model inference call.",
     )
 
     return parser
@@ -649,6 +799,8 @@ def aggregate_single(relation):
         raise ValueError(f"Unknown model: {args.model}")
 
     nnm = nnm.to(args.device)
+    if nnm.rules.weight.device.type == "cpu":
+        raise RuntimeError("GPU-only eval requires CUDA device; please set --device cuda")
 
     optimizer = torch.optim.Adam(nnm.parameters(), lr=lr)
     train_dataloader = dataloader
@@ -679,14 +831,10 @@ def aggregate_single(relation):
         do_eval = ((t + 1) % evaluate_every == 0) or (t == max_epoch - 1)
         if do_eval:
             eval_start = perf_counter()
-            with step_timer("epoch_model_to_cpu"):
-                nnm.cpu()
             with step_timer("epoch_eval_head"):
                 head_mrr.update(nnm, (pos, lr, t))
             with step_timer("epoch_eval_tail"):
                 tail_mrr.update(nnm, (pos, lr, t))
-            with step_timer("epoch_model_to_device"):
-                nnm.to(args.device)
             eval_seconds += perf_counter() - eval_start
 
             valid_combined_raw = (head_mrr.maximums_v_raw + tail_mrr.maximums_v_raw) / 2.0
@@ -919,6 +1067,7 @@ def aggregate_multiple():
     return _finalize_relation_sweep(success_relations, failed_relations, relation_test_counts, sweep_seconds)
 
 args = get_parser().parse_args()
+EVAL_DEVICE = torch.device(args.device)
 args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"
 args.directory_preprocessed_datasets = f"./{args.dataset}/datasets/"
 time = datetime.now().strftime("%m%d-%H%M")
@@ -963,7 +1112,11 @@ for rule_id in range(LEN_RULES):
     # 避免出现“int object is not subscriptable”。
     rule = rule_features[rule_id]
     rule_conf_values[rule_id] = int(rule[1]) / (int(rule[0]) + 5)
-RULE_CONF_TABLE = torch.tensor(rule_conf_values + [0.0], dtype=torch.float32)
+
+RULE_CONF_TABLE_CPU = torch.tensor(rule_conf_values + [0.0], dtype=torch.float32)
+if EVAL_DEVICE.type == "cpu":
+    raise RuntimeError("This version uses GPU-only eval. Please run with --device cuda")
+RULE_CONF_TABLE = RULE_CONF_TABLE_CPU.to(EVAL_DEVICE)
 
 # 优化点：预构建 relation -> keys 索引，避免每次 get_ranks 线性扫描所有 keys。
 relation_keys = {
