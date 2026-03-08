@@ -180,7 +180,11 @@ def test(dataloader, model, loss_fn):
             loss = loss_fn(pred, y)
             test_loss += loss.item()
 
-            correct += ((torch.sigmoid(pred) > 0.5) == y.to(args.device)).type(torch.float).sum().item()
+            if args.model in ["NoisyOrAggregator", "SurprisalAggregator"]:
+                pred_prob = pred
+            else:
+                pred_prob = torch.sigmoid(pred)
+            correct += ((pred_prob > 0.5) == y.to(args.device)).type(torch.float).sum().item()
     test_loss /= num_batches
     correct /= size
     return test_loss
@@ -260,7 +264,7 @@ def rank_batch_group(nnm, batch_items):
     with step_timer("epoch_eval.rank_model_infer"):
         with torch.no_grad():
             pred_all = nnm(rules_all).detach()
-            if args.model != "NoisyOrAggregator":
+            if args.model not in ["NoisyOrAggregator", "SurprisalAggregator"]:
                 pred_all = torch.sigmoid(pred_all).detach()
     max_conf_all = RULE_CONF_TABLE[rules_all].max(dim=1, keepdim=True).values
     score_all = (pred_all * max_conf_all).squeeze(dim=1)
@@ -404,6 +408,53 @@ class LinearAggregator(nn.Module):
         logits = local_rules.sum(dim=1) + self.bias
         return logits
 
+
+class SurprisalAggregator(nn.Module):
+    def init_weights(self):
+        with torch.no_grad():
+            torch.manual_seed(0)
+            confs = RULE_CONF_TABLE_CPU[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
+            confs = confs.clamp(min=0.0, max=1 - 1e-7)
+            surprisal = -torch.log(1 - confs)
+            if self.sign_constraint:
+                surprisal = torch.sqrt(torch.clamp(surprisal, min=0.0))
+            self.rules.weight[: self.num_relation_rules] = surprisal
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            self.bias.uniform_(-bound, bound)
+
+    def __init__(self, relation, sign_constraint=False):
+        super().__init__()
+        self.sign_constraint = sign_constraint
+
+        relation_rule_ids = sorted(rule_map.get(relation, []))
+        self.relation_rule_ids = np.array(relation_rule_ids, dtype=np.int64)
+        self.num_relation_rules = len(relation_rule_ids)
+        self.pad_local_tok = self.num_relation_rules
+
+        self.rules = nn.Embedding(self.num_relation_rules + 1, 1, padding_idx=self.pad_local_tok)
+        self.bias = nn.Parameter(torch.zeros(1, 1))
+
+        global_to_local = torch.full((LEN_RULES + 1,), self.pad_local_tok, dtype=torch.long)
+        if self.num_relation_rules > 0:
+            global_to_local[torch.tensor(relation_rule_ids, dtype=torch.long)] = torch.arange(
+                self.num_relation_rules, dtype=torch.long
+            )
+        self.register_buffer("global_to_local", global_to_local)
+
+        self.init_weights()
+
+    def forward(self, rules):
+        local_rules = self.global_to_local[rules.long()]
+        mask = local_rules == self.pad_local_tok
+        local_rules = self.rules(local_rules)
+        local_rules.masked_fill_(mask.unsqueeze(dim=2), 0.0)
+        if self.sign_constraint:
+            local_rules = local_rules**2
+        else:
+            local_rules = torch.abs(local_rules)
+        score = local_rules.sum(dim=1) + self.bias
+        return 1 - torch.exp(-score)
 
 class NoisyOrAggregator(nn.Module):
     def init_weights(self):
@@ -649,7 +700,7 @@ def get_parser():
     parser.add_argument(
         "--model",
         action="store",
-        help="Aggregator to use; one of ['LinearAggregator', 'NoisyOrAggregator']",
+        help="Aggregator to use; one of ['LinearAggregator', 'SurprisalAggregator', 'NoisyOrAggregator']",
         default="LinearAggregator",
     )
     parser.add_argument("--shuffle_train", action="store_true", help="Shuffles the examples before creating batches")
@@ -752,7 +803,7 @@ def BCELossR(weights=[1, 1], reduction="mean", apply_sigmoid=False):
     def loss(input, target):
         if apply_sigmoid:
             input = torch.sigmoid(input)
-            input = torch.clamp(input, min=1e-7, max=1 - 1e-7)
+        input = torch.clamp(input, min=1e-7, max=1 - 1e-7)
         bce = -weights[1] * target * torch.log(input) - (1 - target) * weights[0] * torch.log(1 - input)
         if reduction == "libkge":
             bce = (
@@ -783,6 +834,8 @@ def aggregate_single(relation):
     head_mrr = MRR(relation=relation, direction="s")
     if args.model == "LinearAggregator":
         nnm = LinearAggregator(relation=relation, sign_constraint=args.sign_constraint)
+    elif args.model == "SurprisalAggregator":
+        nnm = SurprisalAggregator(relation=relation, sign_constraint=args.sign_constraint)
     elif args.model == "NoisyOrAggregator":
         nnm = NoisyOrAggregator(relation=relation)
     else:
@@ -799,8 +852,10 @@ def aggregate_single(relation):
 
     if args.model == "LinearAggregator":
         loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos).float())
-    elif args.model == "NoisyOrAggregator":
+    elif args.model == "SurprisalAggregator":
         loss_fn = BCELossR([1, pos])
+    elif args.model == "NoisyOrAggregator":
+        loss_fn = BCELossR([1, pos], apply_sigmoid=True)
 
     eval_every_values = parse_csv_schedule(args.evaluate_every, int, "evaluate_every")
     if any(v < 0 for v in eval_every_values):
@@ -886,7 +941,7 @@ def aggregate_single(relation):
     if len(relation_rule_ids) > 0:
         with torch.no_grad():
             local_weights = nnm.rules.weight[: nnm.num_relation_rules, 0].detach().cpu().numpy()
-            if args.model == "LinearAggregator" and args.sign_constraint:
+            if args.model in ["LinearAggregator", "SurprisalAggregator"] and args.sign_constraint:
                 local_weights = np.square(local_weights)
             elif args.model == "NoisyOrAggregator":
                 local_weights = 1 / (1 + np.exp(-local_weights))
