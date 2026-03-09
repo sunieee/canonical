@@ -1061,7 +1061,7 @@ def _merge_metric_files(metric_files, relation_test_counts):
     }
 
 
-def _finalize_relation_sweep(success_relations, failed_relations, relation_test_counts, sweep_seconds):
+def _finalize_relation_sweep(failed_relations, relation_test_counts, sweep_seconds):
     metric_files = sorted(glob.glob(os.path.join(args.experiment, "metric-*.json")))
     merged = _merge_metric_files(metric_files, relation_test_counts)
 
@@ -1080,7 +1080,6 @@ def _finalize_relation_sweep(success_relations, failed_relations, relation_test_
         "experiment": args.experiment,
         "model": args.model,
         "dataset": args.dataset,
-        "success_relations": success_relations,
         "failed_relations": failed_relations,
         "summary": merged,
         "time_seconds": summed_time_seconds,
@@ -1090,7 +1089,7 @@ def _finalize_relation_sweep(success_relations, failed_relations, relation_test_
     with open(out_path, "w") as f:
         json.dump(final_result, f, indent=4)
 
-    print(f"Finished relation sweep. success={len(success_relations)}, failed={len(failed_relations)}")
+    print(f"Finished relation sweep. failed={len(failed_relations)}")
     print(f"Final summary saved to {out_path}")
     return final_result
 
@@ -1102,18 +1101,16 @@ def aggregate_all_relations_sequential():
 
     print(f"Start relation sweep (sequential), total relations: {len(relations)}")
 
-    success_relations = []
     failed_relations = {}
 
     for relation in relations:
         try:
             aggregate_single(relation)
-            success_relations.append(int(relation))
         except Exception as e:
             failed_relations[int(relation)] = str(e)
 
     sweep_seconds = perf_counter() - sweep_start_time
-    return _finalize_relation_sweep(success_relations, failed_relations, relation_test_counts, sweep_seconds)
+    return _finalize_relation_sweep(failed_relations, relation_test_counts, sweep_seconds)
 
 
 def _run_one_relation(relation):
@@ -1135,7 +1132,6 @@ def aggregate_multiple():
 
     print(f"Start relation sweep, total relations: {len(relations)}, processes: {num_processes}")
 
-    success_relations = []
     failed_relations = {}
 
     if relations:
@@ -1143,12 +1139,12 @@ def aggregate_multiple():
             results = [pool.apply_async(_run_one_relation, (relation,)) for relation in relations]
             for relation, result in zip(relations, results):
                 try:
-                    success_relations.append(result.get())
+                    result.get()
                 except Exception as e:
                     failed_relations[int(relation)] = str(e)
 
     sweep_seconds = perf_counter() - sweep_start_time
-    return _finalize_relation_sweep(success_relations, failed_relations, relation_test_counts, sweep_seconds)
+    return _finalize_relation_sweep(failed_relations, relation_test_counts, sweep_seconds)
 
 args = get_parser().parse_args()
 EVAL_DEVICE = torch.device(args.device)
