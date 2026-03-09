@@ -19,12 +19,12 @@ cd explanations
 bash process.sh
 cd ..
 
-# 构建 canonical 训练数据
-python create_datasets.py \
-  -d $dataset \
-  -e $dataset/expl/explanations-processed/ \
-  -o $dataset/datasets
+export dataset=codex-m
 
+python create_explanations.py -d $dataset
+
+# 构建 canonical 训练数据
+python create_datasets.py -d $dataset
 
 # 训练 canonical 聚合器 + 链接预测评估
-python aggregation.py -d $dataset
+python aggregation.py -d $dataset --relation -1 --multiprocess 3

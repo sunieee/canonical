@@ -389,7 +389,7 @@ class LinearAggregator(nn.Module):
         self.rules = nn.Embedding(self.num_relation_rules + 1, 1, padding_idx=self.pad_local_tok)
         self.bias = nn.Parameter(torch.zeros(1, 1))
 
-        global_to_local = torch.full((LEN_RULES + 1,), self.pad_local_tok, dtype=torch.long)
+        global_to_local = torch.full((PAD_TOK + 1,), self.pad_local_tok, dtype=torch.long)
         if self.num_relation_rules > 0:
             global_to_local[torch.tensor(relation_rule_ids, dtype=torch.long)] = torch.arange(
                 self.num_relation_rules, dtype=torch.long
@@ -435,7 +435,7 @@ class SurprisalAggregator(nn.Module):
         self.rules = nn.Embedding(self.num_relation_rules + 1, 1, padding_idx=self.pad_local_tok)
         self.bias = nn.Parameter(torch.zeros(1, 1))
 
-        global_to_local = torch.full((LEN_RULES + 1,), self.pad_local_tok, dtype=torch.long)
+        global_to_local = torch.full((PAD_TOK + 1,), self.pad_local_tok, dtype=torch.long)
         if self.num_relation_rules > 0:
             global_to_local[torch.tensor(relation_rule_ids, dtype=torch.long)] = torch.arange(
                 self.num_relation_rules, dtype=torch.long
@@ -474,7 +474,7 @@ class NoisyOrAggregator(nn.Module):
 
         self.rules = nn.Embedding(self.num_relation_rules + 1, 1, padding_idx=self.pad_local_tok)
 
-        global_to_local = torch.full((LEN_RULES + 1,), self.pad_local_tok, dtype=torch.long)
+        global_to_local = torch.full((PAD_TOK + 1,), self.pad_local_tok, dtype=torch.long)
         if self.num_relation_rules > 0:
             global_to_local[torch.tensor(relation_rule_ids, dtype=torch.long)] = torch.arange(
                 self.num_relation_rules, dtype=torch.long
@@ -1180,22 +1180,25 @@ processed_po_test = pickle.load(open(args.directory_explanations + "processed_po
 processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_sp_valid.pkl", "rb"))
 processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
 
-rule_map = pickle.load(open(args.directory_explanations + "rule_map.pkl", "rb"))
 rule_features = pickle.load(open(args.directory_explanations + "rule_features.pkl", "rb"))
 
 LEN_RULES = len(rule_features)
-PAD_TOK = LEN_RULES
+MAX_RULE_ID = max(rule_features.keys()) if len(rule_features) > 0 else 0
+PAD_TOK = MAX_RULE_ID + 1
+
+rule_map = pickle.load(open(args.directory_explanations + "rule_map.pkl", "rb"))
 
 # 优化点：预构建规则置信度查表，替代 eval 阶段的 np.vectorize(get_conf) 重复计算。
 # 约定最后一个位置 PAD_TOK 的置信度为 0。
-rule_conf_values = [0.0] * LEN_RULES
-for rule_id in range(LEN_RULES):
-    # rule_features 可能是 dict（遍历时返回 key:int），因此这里按 id 索引取值，
-    # 避免出现“int object is not subscriptable”。
-    rule = rule_features[rule_id]
-    rule_conf_values[rule_id] = int(rule[1]) / (int(rule[0]) + 5)
+rule_conf_values = [0.0] * (PAD_TOK + 1)
+for rule_id, rule in rule_features.items():
+    rid = int(rule_id)
+    if rid < 0 or rid >= PAD_TOK:
+        continue
+    rule_conf_values[rid] = int(rule[1]) / (int(rule[0]) + 5)
 
-RULE_CONF_TABLE_CPU = torch.tensor(rule_conf_values + [0.0], dtype=torch.float32)
+# PAD_TOK 的置信度保留为 0.0
+RULE_CONF_TABLE_CPU = torch.tensor(rule_conf_values, dtype=torch.float32)
 if EVAL_DEVICE.type == "cpu":
     raise RuntimeError("This version uses GPU-only eval. Please run with --device cuda")
 RULE_CONF_TABLE = RULE_CONF_TABLE_CPU.to(EVAL_DEVICE)

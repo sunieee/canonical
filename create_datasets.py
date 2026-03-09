@@ -137,15 +137,14 @@ if __name__ == "__main__":
     processed_sp_valid = pickle.load(open(os.path.join(args["explanation"], "processed_sp_valid.pkl"), "rb"))
     processed_po_valid = pickle.load(open(os.path.join(args["explanation"], "processed_po_valid.pkl"), "rb"))
 
-    rule_map = pickle.load(open(os.path.join(args["explanation"], "rule_map.pkl"), "rb"))
     rule_features = pickle.load(open(os.path.join(args["explanation"], "rule_features.pkl"), "rb"))
-    ruleid2relid = {ruleid: relid for relid in rule_map for ruleid in rule_map[relid]}
 
     filter_test = set([tuple(x.tolist()) for x in test_torch])
     filter_valid = set([tuple(x.tolist()) for x in valid_torch])
 
     LEN_RULES = len(rule_features)
-    PAD_TOK = LEN_RULES
+    MAX_RULE_ID = max(rule_features.keys()) if len(rule_features) > 0 else 0
+    PAD_TOK = MAX_RULE_ID + 1
 
     num_relations = dataset.num_relations()
     num_workers = cpu_count()
