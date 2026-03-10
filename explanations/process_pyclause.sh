@@ -61,7 +61,6 @@ run_split() {
     --output "$APPLIED_RULES_FILE" \
     --max-explanations 200 \
     --topk 100 \
-    --hard-stop-at -1 \
     --worker-threads $worker_threads \
     --aggregation maxplus \
     --min-correct-predictions 5 \

@@ -325,6 +325,7 @@ def parse_rule_file_metadata(rule_file: str, relation_ids):
     relation_to_id = {rel: idx for idx, rel in enumerate(relation_ids)}
     rule_map = defaultdict(list)
     rule_conf_by_id = {}
+    rule_relation_by_id = {}
     num_rules = 0
     max_rule_id = 0
 
@@ -352,13 +353,56 @@ def parse_rule_file_metadata(rule_file: str, relation_ids):
             rel_id = relation_to_id.get(rel)
             if rel_id is not None:
                 rule_map[rel_id].append(int(line_no))
+                rule_relation_by_id[int(line_no)] = int(rel_id)
 
     return {
         "rule_map": dict(rule_map),
         "rule_conf_by_id": rule_conf_by_id,
+        "rule_relation_by_id": rule_relation_by_id,
         "num_rules": int(num_rules),
         "max_rule_id": int(max_rule_id),
     }
+
+
+def parse_synergy_file(synergy_file: str, rule_relation_by_id):
+    synergy_by_relation = defaultdict(list)
+    if not synergy_file or (not os.path.exists(synergy_file)):
+        return {}
+
+    seen_pairs = defaultdict(set)
+    with open(synergy_file, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 5:
+                parts = re.split(r"\s+", line)
+            if len(parts) < 5:
+                continue
+
+            try:
+                lift = float(parts[2])
+                id1 = int(parts[3])
+                id2 = int(parts[4])
+            except Exception:
+                continue
+
+            if lift <= 0:
+                continue
+
+            rel1 = rule_relation_by_id.get(id1)
+            rel2 = rule_relation_by_id.get(id2)
+            if rel1 is None or rel2 is None or rel1 != rel2:
+                continue
+
+            a, b = (id1, id2) if id1 <= id2 else (id2, id1)
+            if (a, b) in seen_pairs[rel1]:
+                continue
+            seen_pairs[rel1].add((a, b))
+            synergy_by_relation[rel1].append((a, b, float(lift)))
+
+    return dict(synergy_by_relation)
 
 
 def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=False):
@@ -480,9 +524,15 @@ class SurprisalAggregator(nn.Module):
             if self.sign_constraint:
                 surprisal = torch.sqrt(torch.clamp(surprisal, min=0.0))
             self.rules.weight[: self.num_relation_rules] = surprisal
+            if self.num_relation_synergy > 0:
+                synergy_init = torch.tensor(self.relation_synergy_lifts, dtype=torch.float32).reshape(-1, 1)
+                if self.sign_constraint:
+                    synergy_init = torch.sqrt(torch.clamp(synergy_init, min=0.0))
+                self.synergy.weight[: self.num_relation_synergy] = synergy_init
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             self.bias.uniform_(-bound, bound)
+            self.gamma.fill_(1.0)
 
     def __init__(self, relation, sign_constraint=False):
         super().__init__()
@@ -493,8 +543,15 @@ class SurprisalAggregator(nn.Module):
         self.num_relation_rules = len(relation_rule_ids)
         self.pad_local_tok = self.num_relation_rules
 
+        relation_synergy = sorted(synergy_map.get(relation, []), key=lambda x: (x[0], x[1]))
+        local_pairs = []
+        local_lifts = []
+        global_pairs_filtered = []
+
         self.rules = nn.Embedding(self.num_relation_rules + 1, 1, padding_idx=self.pad_local_tok)
+        self.synergy = nn.Embedding(1, 1, padding_idx=0)
         self.bias = nn.Parameter(torch.zeros(1, 1))
+        self.gamma = nn.Parameter(torch.tensor(1.0))
 
         global_to_local = torch.full((PAD_TOK + 1,), self.pad_local_tok, dtype=torch.long)
         if self.num_relation_rules > 0:
@@ -503,19 +560,61 @@ class SurprisalAggregator(nn.Module):
             )
         self.register_buffer("global_to_local", global_to_local)
 
+        for a, b, lift in relation_synergy:
+            local_a = int(global_to_local[a].item())
+            local_b = int(global_to_local[b].item())
+            if local_a == self.pad_local_tok or local_b == self.pad_local_tok:
+                continue
+            local_pairs.append((local_a, local_b))
+            local_lifts.append(float(lift))
+            global_pairs_filtered.append((int(a), int(b)))
+
+        self.num_relation_synergy = len(local_pairs)
+        self.pad_synergy_tok = self.num_relation_synergy
+        self.synergy = nn.Embedding(self.num_relation_synergy + 1, 1, padding_idx=self.pad_synergy_tok)
+        self.relation_synergy_lifts = local_lifts
+        self.relation_synergy_pairs_global = global_pairs_filtered
+
+        if self.num_relation_synergy > 0:
+            pair_a = torch.tensor([p[0] for p in local_pairs], dtype=torch.long)
+            pair_b = torch.tensor([p[1] for p in local_pairs], dtype=torch.long)
+        else:
+            pair_a = torch.empty((0,), dtype=torch.long)
+            pair_b = torch.empty((0,), dtype=torch.long)
+        self.register_buffer("synergy_pair_a_local", pair_a)
+        self.register_buffer("synergy_pair_b_local", pair_b)
+
         self.init_weights()
 
     def forward(self, rules):
         local_rules = self.global_to_local[rules.long()]
         mask = local_rules == self.pad_local_tok
-        local_rules = self.rules(local_rules)
-        local_rules.masked_fill_(mask.unsqueeze(dim=2), 0.0)
+        rule_w = self.rules(local_rules).squeeze(dim=2)
+        rule_w.masked_fill_(mask, 0.0)
         if self.sign_constraint:
-            local_rules = local_rules**2
-        else:
-            local_rules = torch.abs(local_rules)
-        score = local_rules.sum(dim=1) + self.bias
-        return 1 - torch.exp(-score)
+            rule_w = rule_w**2
+        score = rule_w.sum(dim=1, keepdim=True)
+
+        if self.num_relation_synergy > 0:
+            batch_size = int(local_rules.shape[0])
+            active = ~mask
+            active_matrix = torch.zeros(
+                (batch_size, self.num_relation_rules), dtype=torch.bool, device=local_rules.device
+            )
+            row_idx = torch.arange(batch_size, device=local_rules.device).unsqueeze(1).expand_as(local_rules)
+            active_matrix[row_idx[active], local_rules[active]] = True
+
+            pair_active = active_matrix[:, self.synergy_pair_a_local] & active_matrix[:, self.synergy_pair_b_local]
+            synergy_w = self.synergy.weight[: self.num_relation_synergy, 0].reshape(1, -1)
+            if self.sign_constraint:
+                synergy_w = synergy_w**2
+            synergy_score = (pair_active.float() * synergy_w).sum(dim=1, keepdim=True)
+            score = score + self.gamma * synergy_score
+
+        score = score + self.bias
+        score = 1 - torch.exp(-score)
+        score = torch.clamp(score, min=1e-7, max=1 - 1e-7)
+        return score
 
 class NoisyOrAggregator(nn.Module):
     def init_weights(self):
@@ -821,6 +920,12 @@ def get_parser():
         default="",
         help="Path to rules file. Default: ./<dataset>/rules/rules-1000",
     )
+    parser.add_argument(
+        "--synergy_file",
+        action="store",
+        default="",
+        help="Path to synergy file. Default: ./<dataset>/rules/synergy.txt",
+    )
 
     return parser
 
@@ -917,6 +1022,15 @@ def aggregate_single(relation):
         initial_rule_weights = nnm.rules.weight[: nnm.num_relation_rules, 0].detach().cpu().numpy().copy()
         initial_bias_value = float(nnm.bias.detach().reshape(-1)[0].cpu().item()) if hasattr(nnm, "bias") else None
         initial_gamma_value = float(nnm.gamma.detach().reshape(-1)[0].cpu().item()) if hasattr(nnm, "gamma") else None
+    synergy_pairs = []
+    initial_synergy_weights = np.array([], dtype=np.float32)
+    if args.model == "SurprisalAggregator":
+        synergy_pairs = list(getattr(nnm, "relation_synergy_pairs_global", []))
+        if getattr(nnm, "num_relation_synergy", 0) > 0:
+            with torch.no_grad():
+                initial_synergy_weights = (
+                    nnm.synergy.weight[: nnm.num_relation_synergy, 0].detach().cpu().numpy().copy()
+                )
 
     optimizer = torch.optim.Adam(nnm.parameters(), lr=lr_values[0])
     train_dataloader = dataloader
@@ -1013,9 +1127,18 @@ def aggregate_single(relation):
     if len(relation_rule_ids) > 0:
         with torch.no_grad():
             trained_rule_weights = nnm.rules.weight[: nnm.num_relation_rules, 0].detach().cpu().numpy()
-            learned_weights = list(
-                zip(relation_rule_ids, initial_rule_weights.tolist(), trained_rule_weights.tolist())
-            )
+        learned_weights = list(
+            zip(relation_rule_ids, initial_rule_weights.tolist(), trained_rule_weights.tolist())
+        )
+
+    learned_synergy_weights = []
+    if args.model == "SurprisalAggregator" and len(synergy_pairs) > 0:
+        with torch.no_grad():
+            trained_synergy_weights = nnm.synergy.weight[: nnm.num_relation_synergy, 0].detach().cpu().numpy()
+        learned_synergy_weights = [
+            (int(a), int(b), float(o), float(t))
+            for (a, b), o, t in zip(synergy_pairs, initial_synergy_weights.tolist(), trained_synergy_weights.tolist())
+        ]
 
     with torch.no_grad():
         trained_bias_value = float(nnm.bias.detach().reshape(-1)[0].cpu().item()) if hasattr(nnm, "bias") else None
@@ -1023,6 +1146,7 @@ def aggregate_single(relation):
 
     num_test_samples = int(test_torch[test_torch[:, 1] == relation].shape[0])
     num_relation_rules = int(len(relation_rule_ids))
+    num_relation_synergy = int(len(synergy_map.get(relation, [])))
 
     best_valid_mrr, best_valid_mrr_raw = calc_mrr(tail_mrr, head_mrr, "maximums_v")
     relation_total_seconds = perf_counter() - relation_start_time
@@ -1034,6 +1158,8 @@ def aggregate_single(relation):
         "relation": int(relation),
         "num_test_samples": num_test_samples,
         "num_relation_rules": num_relation_rules,
+        "num_relation_synergy": num_relation_synergy,
+        "num_relation_features": int(num_relation_rules + num_relation_synergy),
         "train": {
             "max_epoch": int(max_epoch),
             "epochs_trained": int(epochs_trained),
@@ -1089,6 +1215,11 @@ def aggregate_single(relation):
             writer = csv.writer(f)
             writer.writerow(["ruleID", "original", "trained"])
             writer.writerows(learned_weights)
+
+        with open(f"{args.experiment}/synergy-{relation}.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["rule1ID", "rule2ID", "original", "trained"])
+            writer.writerows(learned_synergy_weights)
 
     return metrics
 
@@ -1265,8 +1396,10 @@ processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_s
 processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
 
 rule_file = args.rule_file if args.rule_file else f"./{args.dataset}/rules/rules-1000"
+synergy_file = args.synergy_file if args.synergy_file else os.path.join(os.path.dirname(rule_file), "synergy.txt")
 relation_ids = read_ids(f"./{args.dataset}/relation_ids.del")
 rule_meta = parse_rule_file_metadata(rule_file, relation_ids)
+synergy_map = parse_synergy_file(synergy_file, rule_meta["rule_relation_by_id"])
 
 LEN_RULES = rule_meta["num_rules"]
 MAX_RULE_ID = rule_meta["max_rule_id"]

@@ -6,12 +6,17 @@
 # pip install -e .
 # cd ..
 
-for dataset in fb15k-237 wnrr codex-m codex-l YAGO3-10 KG20C; do
+# fb15k-237 wnrr codex-m codex-l YAGO3-10 KG20C
+for dataset in wnrr KG20C codex-m; do
     echo "Processing $dataset"
     export dataset=$dataset
     # 用规则生成 explanations
 
-    ln -s `pwd`/$dataset `pwd`/kge/data/$dataset
+    # 不存在数据集文件夹则创建符号链接
+    target_dir=`pwd`/kge/data/$dataset
+    if [ ! -d "$target_dir" ]; then
+        ln -s `pwd`/$dataset $target_dir
+    fi
     cd explanations
     bash process.sh
     cd ..
