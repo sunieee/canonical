@@ -4,6 +4,7 @@ import os.path
 from os import path
 import pickle
 import argparse
+from tqdm import tqdm
 
 
 def preprocess_rules(file, relation_ids):
@@ -42,23 +43,23 @@ def preprocess_candidates(file: str, entity_ids: list, relation_ids: list, rule_
     processed_sp = {}
     processed_po = {}
 
+    entity_id_to_idx = {ent: idx for idx, ent in enumerate(entity_ids)}
+    relation_id_to_idx = {rel: idx for idx, rel in enumerate(relation_ids)}
+
     longest = 0
-    cnt = 0
     with open(file, "r") as f:
         txt = f.read().split("}}},")
 
         if txt[-1] == "\n":
             txt = txt[:-1]
 
-        for line in txt:
-            cnt += 1
-            if cnt % 100 ==0:
-                print(f"processed {cnt} explanations")
+        for line in tqdm(txt):
             proc = line.replace("\n", "") + "}}}"
             raw_dict = ast.literal_eval(proc)
             raw_triple = list(raw_dict.keys())[0].split(" ")
-            S, P, O = entity_ids.index(raw_triple[0]), relation_ids.index(raw_triple[1]), entity_ids.index(
-                raw_triple[2])
+            S = entity_id_to_idx[raw_triple[0]]
+            P = relation_id_to_idx[raw_triple[1]]
+            O = entity_id_to_idx[raw_triple[2]]
             raw_meta = list(raw_dict.values())[0]
             raw_heads = raw_meta["heads"]
             raw_tails = raw_meta["tails"]
@@ -71,16 +72,17 @@ def preprocess_candidates(file: str, entity_ids: list, relation_ids: list, rule_
             if "me_myself_i" in raw_tails["candidates"]:
                 raw_tails["candidates"][raw_tails["candidates"].index("me_myself_i")] = raw_triple[0]
 
-            raw_heads["candidates"] = list(map(lambda can: entity_ids.index(can), raw_heads["candidates"]))
-            raw_tails["candidates"] = list(map(lambda can: entity_ids.index(can), raw_tails["candidates"]))
+            raw_heads["candidates"] = [entity_id_to_idx[can] for can in raw_heads["candidates"]]
+            raw_tails["candidates"] = [entity_id_to_idx[can] for can in raw_tails["candidates"]]
 
             rules_heads = []
             # assign global rule indices to the rules
+            rule_list = rule_map.get(P)
             for candidate in raw_heads["rules"]:
                 cands = []
-                for local_rule_index in candidate:
-                    if P in rule_map:
-                        global_idx = rule_map[P][local_rule_index]
+                if rule_list is not None:
+                    for local_rule_index in candidate:
+                        global_idx = rule_list[local_rule_index]
                         cands.append(global_idx)
                 if len(cands) > longest:
                     longest = len(cands)
@@ -91,9 +93,9 @@ def preprocess_candidates(file: str, entity_ids: list, relation_ids: list, rule_
             # assign global rule indices to the rules
             for candidate in raw_tails["rules"]:
                 cands = []
-                for local_rule_index in candidate:
-                    if P in rule_map:
-                        global_idx = rule_map[P][local_rule_index]
+                if rule_list is not None:
+                    for local_rule_index in candidate:
+                        global_idx = rule_list[local_rule_index]
                         cands.append(global_idx)
                 rules_tails.append(cands)
                 if len(cands) > longest:
@@ -105,9 +107,13 @@ def preprocess_candidates(file: str, entity_ids: list, relation_ids: list, rule_
 
             if (S, P) in processed_sp:
                 # add the candidate to the sp_ candidates if it is within the topk
-                if O in raw_meta["tails"]["candidates"]:
+                idx_O = None
+                for idx, cand in enumerate(raw_meta["tails"]["candidates"]):
+                    if cand == O:
+                        idx_O = idx
+                        break
+                if idx_O is not None:
                     processed_sp[(S, P)]["candidates"].append(O)
-                    idx_O = raw_meta["tails"]["candidates"].index(O)
                     processed_sp[(S, P)]["rules"].append(copy.copy(raw_meta["tails"]["rules"][idx_O]))
             else:
                 processed_sp[(S, P)] = {}
@@ -115,9 +121,13 @@ def preprocess_candidates(file: str, entity_ids: list, relation_ids: list, rule_
                 processed_sp[(S, P)]["rules"] = copy.deepcopy(raw_meta["tails"]["rules"])
 
             if (P, O) in processed_po:
-                if S in raw_meta["heads"]["candidates"]:
+                idx_S = None
+                for idx, cand in enumerate(raw_meta["heads"]["candidates"]):
+                    if cand == S:
+                        idx_S = idx
+                        break
+                if idx_S is not None:
                     processed_po[(P, O)]["candidates"].append(S)
-                    idx_S = raw_meta["heads"]["candidates"].index(S)
                     processed_po[(P, O)]["rules"].append(copy.copy(raw_meta["heads"]["rules"][idx_S]))
             else:
                 processed_po[(P, O)] = {}

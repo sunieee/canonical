@@ -10,6 +10,7 @@ import json
 import math
 import os
 import pickle
+import re
 import shutil
 import uuid
 import warnings
@@ -298,6 +299,66 @@ def build_relation_key_index(index_dict, direction="o"):
         for key in index_dict.keys():
             relation_to_keys[key[0]].append(key)
     return relation_to_keys
+
+
+def read_ids(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        raw = f.read().splitlines()
+    return [line.split("\t")[1] for line in raw]
+
+
+def split_rule_line(line: str):
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) >= 4:
+        return parts
+    return re.split(r"\s+", line.strip(), maxsplit=3)
+
+
+def extract_head_relation(rule_str: str):
+    head = rule_str.split(" <= ", 1)[0].strip()
+    if "(" not in head:
+        return ""
+    return head.split("(", 1)[0].strip()
+
+
+def parse_rule_file_metadata(rule_file: str, relation_ids):
+    relation_to_id = {rel: idx for idx, rel in enumerate(relation_ids)}
+    rule_map = defaultdict(list)
+    rule_conf_by_id = {}
+    num_rules = 0
+    max_rule_id = 0
+
+    with open(rule_file, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            parts = split_rule_line(line)
+            if len(parts) < 4:
+                continue
+
+            num_rules += 1
+            max_rule_id = line_no
+
+            try:
+                num_preds = int(float(parts[0].strip()))
+                num_true = int(float(parts[1].strip()))
+            except Exception:
+                num_preds = 0
+                num_true = 0
+            conf = (num_true / (num_preds + 5)) if num_preds >= 0 else 0.0
+            rule_conf_by_id[line_no] = float(conf)
+
+            rel = extract_head_relation(parts[3].strip())
+            rel_id = relation_to_id.get(rel)
+            if rel_id is not None:
+                rule_map[rel_id].append(int(line_no))
+
+    return {
+        "rule_map": dict(rule_map),
+        "rule_conf_by_id": rule_conf_by_id,
+        "num_rules": int(num_rules),
+        "max_rule_id": int(max_rule_id),
+    }
 
 
 def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=False):
@@ -754,6 +815,12 @@ def get_parser():
         type=int,
         help="How many eval keys to group into one model inference call.",
     )
+    parser.add_argument(
+        "--rule_file",
+        action="store",
+        default="",
+        help="Path to rules file. Default: ./<dataset>/rules/rules-1000",
+    )
 
     return parser
 
@@ -1180,22 +1247,23 @@ processed_po_test = pickle.load(open(args.directory_explanations + "processed_po
 processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_sp_valid.pkl", "rb"))
 processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
 
-rule_features = pickle.load(open(args.directory_explanations + "rule_features.pkl", "rb"))
+rule_file = args.rule_file if args.rule_file else f"./{args.dataset}/rules/rules-1000"
+relation_ids = read_ids(f"./{args.dataset}/relation_ids.del")
+rule_meta = parse_rule_file_metadata(rule_file, relation_ids)
 
-LEN_RULES = len(rule_features)
-MAX_RULE_ID = max(rule_features.keys()) if len(rule_features) > 0 else 0
+LEN_RULES = rule_meta["num_rules"]
+MAX_RULE_ID = rule_meta["max_rule_id"]
 PAD_TOK = MAX_RULE_ID + 1
-
-rule_map = pickle.load(open(args.directory_explanations + "rule_map.pkl", "rb"))
+rule_map = rule_meta["rule_map"]
 
 # 优化点：预构建规则置信度查表，替代 eval 阶段的 np.vectorize(get_conf) 重复计算。
 # 约定最后一个位置 PAD_TOK 的置信度为 0。
 rule_conf_values = [0.0] * (PAD_TOK + 1)
-for rule_id, rule in rule_features.items():
+for rule_id, conf in rule_meta["rule_conf_by_id"].items():
     rid = int(rule_id)
     if rid < 0 or rid >= PAD_TOK:
         continue
-    rule_conf_values[rid] = int(rule[1]) / (int(rule[0]) + 5)
+    rule_conf_values[rid] = float(conf)
 
 # PAD_TOK 的置信度保留为 0.0
 RULE_CONF_TABLE_CPU = torch.tensor(rule_conf_values, dtype=torch.float32)

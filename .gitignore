@@ -130,9 +130,10 @@ dmypy.json
 
 kge
 datasets
+datasets.*
 expl
 rules
 *.bac
 exp-*
-*.1
-*.2
+expl.*
+*.pckl

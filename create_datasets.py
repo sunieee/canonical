@@ -1,11 +1,34 @@
 import argparse
 import os
 import pickle
+import re
 from multiprocessing import Pool, cpu_count
 
 import torch
 from kge import Config, Dataset
 from tqdm import tqdm
+
+
+def _split_rule_line(line: str):
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) >= 4:
+        return parts
+    return re.split(r"\s+", line.strip(), maxsplit=3)
+
+
+def parse_rule_file_stats(rule_file: str):
+    num_rules = 0
+    max_rule_id = 0
+    with open(rule_file, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            parts = _split_rule_line(line)
+            if len(parts) < 4:
+                continue
+            num_rules += 1
+            max_rule_id = line_no
+    return num_rules, max_rule_id
 
 
 def save(obj, folder, name):
@@ -105,10 +128,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Creates datasets for bce")
     # parser.add_argument("-e", "--explanation", help="Folder containing processed explanations", default=None)
     parser.add_argument("-d", "--dataset", help="Name of the dataset (loaded with libkge)", default="codex-m")
+    parser.add_argument("--rule_file", help="Path to rules file", default="")
     # parser.add_argument("-o", "--output", help="Folder where datasets are written", default="./codex-m/datasets")
     args = vars(parser.parse_args())
     args["explanation"] = os.path.join(args["dataset"], "expl", "explanations-processed")
     args["output"] = os.path.join(args["dataset"], "datasets")
+    if args["rule_file"] == "":
+        args["rule_file"] = os.path.join(args["dataset"], "rules", "rules-1000")
 
     c = Config()
     c.set("dataset.name", args["dataset"])
@@ -137,13 +163,10 @@ if __name__ == "__main__":
     processed_sp_valid = pickle.load(open(os.path.join(args["explanation"], "processed_sp_valid.pkl"), "rb"))
     processed_po_valid = pickle.load(open(os.path.join(args["explanation"], "processed_po_valid.pkl"), "rb"))
 
-    rule_features = pickle.load(open(os.path.join(args["explanation"], "rule_features.pkl"), "rb"))
-
     filter_test = set([tuple(x.tolist()) for x in test_torch])
     filter_valid = set([tuple(x.tolist()) for x in valid_torch])
 
-    LEN_RULES = len(rule_features)
-    MAX_RULE_ID = max(rule_features.keys()) if len(rule_features) > 0 else 0
+    LEN_RULES, MAX_RULE_ID = parse_rule_file_stats(args["rule_file"])
     PAD_TOK = MAX_RULE_ID + 1
 
     num_relations = dataset.num_relations()

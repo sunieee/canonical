@@ -32,6 +32,18 @@ def read_triples(path: str, ent_to_id: Dict[str, int], rel_to_id: Dict[str, int]
     return triples
 
 
+def read_triples_str(path: str) -> List[Tuple[str, str, str]]:
+    triples = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            s, p, o = line.split("\t")
+            triples.append((s, p, o))
+    return triples
+
+
 def build_rule_features_from_rules_file(rules_path: str, allowed_rule_ids=None):
     """
     全局 rule id 采用 rules 文件行号（1-based）。
@@ -118,12 +130,92 @@ def pyclause_apply(
     ranker = RankingHandler(options=opts.get("ranking_handler"))
     ranker.calculate_ranking(loader=loader)
 
-    # int 索引版本，便于后续直接写入 processed_*.pkl
-    head_ranking = ranker.get_ranking(direction="head", as_string=False)
-    tail_ranking = ranker.get_ranking(direction="tail", as_string=False)
-    head_rules = ranker.get_rules(direction="head", as_string=False)
-    tail_rules = ranker.get_rules(direction="tail", as_string=False)
-    return head_ranking, tail_ranking, head_rules, tail_rules
+    # ranking: 同时取字符串版（写 explanations 文件）和索引版（写 processed_*.pkl）
+    head_ranking_idx = ranker.get_ranking(direction="head", as_string=False)
+    tail_ranking_idx = ranker.get_ranking(direction="tail", as_string=False)
+    head_ranking_str = ranker.get_ranking(direction="head", as_string=True)
+    tail_ranking_str = ranker.get_ranking(direction="tail", as_string=True)
+
+    # 关键：applied 情况必须使用 get_applied_rules
+    head_applied_rules = ranker.get_applied_rules(direction="head")
+    tail_applied_rules = ranker.get_applied_rules(direction="tail")
+
+    return (
+        head_ranking_idx,
+        tail_ranking_idx,
+        head_ranking_str,
+        tail_ranking_str,
+        head_applied_rules,
+        tail_applied_rules,
+    )
+
+
+def convert_applied_rules_to_idx(
+    applied_rules: Dict[str, Dict[str, Dict[str, List[int]]]],
+    ent_to_id: Dict[str, int],
+    rel_to_id: Dict[str, int],
+):
+    converted = {}
+    for rel_token, query_map in applied_rules.items():
+        rel_id = rel_to_id.get(rel_token)
+        if rel_id is None:
+            continue
+
+        rel_bucket = converted.setdefault(rel_id, {})
+        for query_ent_token, cand_map in query_map.items():
+            query_ent_id = ent_to_id.get(query_ent_token)
+            if query_ent_id is None:
+                continue
+
+            query_bucket = rel_bucket.setdefault(query_ent_id, {})
+            for cand_token, rids in cand_map.items():
+                cand_id = ent_to_id.get(cand_token)
+                if cand_id is None:
+                    continue
+                query_bucket[cand_id] = [int(rid) for rid in rids if int(rid) > 0]
+    return converted
+
+
+def dump_explanations_file(
+    path: str,
+    target_triples_str: List[Tuple[str, str, str]],
+    head_ranking_str,
+    tail_ranking_str,
+    head_applied_rules,
+    tail_applied_rules,
+    max_explanations: int,
+):
+    with open(path, "w", encoding="utf-8") as f:
+        for s, p, o in target_triples_str:
+            tails_scored = tail_ranking_str.get(p, {}).get(s, [])
+            tails_candidates = [x[0] for x in tails_scored]
+            tail_rules_map = tail_applied_rules.get(p, {}).get(s, {})
+            tails_rules = []
+            for cand in tails_candidates:
+                rids = _convert_rule_ids_to_global(tail_rules_map.get(cand, []))
+                if max_explanations > 0:
+                    rids = rids[:max_explanations]
+                tails_rules.append(rids)
+
+            heads_scored = head_ranking_str.get(p, {}).get(o, [])
+            heads_candidates = [x[0] for x in heads_scored]
+            head_rules_map = head_applied_rules.get(p, {}).get(o, {})
+            heads_rules = []
+            for cand in heads_candidates:
+                rids = _convert_rule_ids_to_global(head_rules_map.get(cand, []))
+                if max_explanations > 0:
+                    rids = rids[:max_explanations]
+                heads_rules.append(rids)
+
+            triple_key = f"{s} {p} {o}"
+            payload = {
+                triple_key: {
+                    "heads": {"candidates": heads_candidates, "rules": heads_rules},
+                    "tails": {"candidates": tails_candidates, "rules": tails_rules},
+                }
+            }
+            # 与 explanations/process.sh 的原始输出风格一致：每条样本后带分隔符 "}}},"
+            f.write(json.dumps(payload, ensure_ascii=False) + ",\n")
 
 
 def get_active_global_rule_ids(
@@ -404,7 +496,14 @@ def main():
     for cfg in split_plan:
         split = cfg["name"]
         print(f"\n===== Processing {split} =====")
-        head_ranking, tail_ranking, head_rules, tail_rules = pyclause_apply(
+        (
+            head_ranking,
+            tail_ranking,
+            head_ranking_str,
+            tail_ranking_str,
+            head_applied_rules,
+            tail_applied_rules,
+        ) = pyclause_apply(
             data_path=cfg["data"],
             filter_path=cfg["filter"],
             target_path=cfg["target"],
@@ -433,16 +532,36 @@ def main():
                     {
                         "head_ranking": head_ranking,
                         "tail_ranking": tail_ranking,
-                        "head_rules": head_rules,
-                        "tail_rules": tail_rules,
+                        "head_applied_rules": head_applied_rules,
+                        "tail_applied_rules": tail_applied_rules,
                     },
                     f,
                     ensure_ascii=False,
                 )
             print(f"Dumped raw apply json: {raw_path}")
 
+            explanation_file = os.path.join(explanations_dir, f"{split}-pyclause-explanations")
+            target_triples_str = read_triples_str(cfg["target"])
+            dump_explanations_file(
+                path=explanation_file,
+                target_triples_str=target_triples_str,
+                head_ranking_str=head_ranking_str,
+                tail_ranking_str=tail_ranking_str,
+                head_applied_rules=head_applied_rules,
+                tail_applied_rules=tail_applied_rules,
+                max_explanations=args.max_explanations,
+            )
+            print(f"Saved explanations file: {explanation_file}")
+
+        head_rules = convert_applied_rules_to_idx(head_applied_rules, ent_to_id=ent_to_id, rel_to_id=rel_to_id)
+        tail_rules = convert_applied_rules_to_idx(tail_applied_rules, ent_to_id=ent_to_id, rel_to_id=rel_to_id)
+
         print(f"Building processed explanations for {split}...")
-        target_triples = read_triples(cfg["target"], ent_to_id=ent_to_id, rel_to_id=rel_to_id)
+        target_triples = [
+            (ent_to_id[s], rel_to_id[p], ent_to_id[o])
+            for s, p, o in target_triples_str
+            if s in ent_to_id and p in rel_to_id and o in ent_to_id
+        ]
         processed, processed_sp, processed_po = build_processed_from_apply(
             target_triples=target_triples,
             head_ranking=head_ranking,
