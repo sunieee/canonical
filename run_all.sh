@@ -4,5 +4,6 @@ python aggregation.py --relation -1 --dataset wnrr > wnrr/run.log 2>&1
 
 
 
-python aggregation.py -d KG20C --relation -1 --multiprocess 3 --model SurprisalAggregator
-python aggregation_dep.py -d KG20C --relation -1 --multiprocess 3 --model SurprisalAggregator
+export dataset=codex-m
+python aggregation.py -d $dataset --relation -1 --multiprocess 3 --model SurprisalAggregator
+python aggregation.py -d $dataset --relation -1 --multiprocess 3 --model SurprisalAggregator --synergy

@@ -7,7 +7,9 @@
 # cd ..
 
 # fb15k-237 wnrr codex-m codex-l YAGO3-10 KG20C
-for dataset in wnrr KG20C codex-m; do
+# wnrr KG20C codex-m
+# fb15k-237 codex-l
+for dataset in fb15k-237 codex-l; do
     echo "Processing $dataset"
     export dataset=$dataset
     # 用规则生成 explanations
