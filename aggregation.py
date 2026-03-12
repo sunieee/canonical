@@ -330,6 +330,7 @@ def parse_rule_file_metadata(rule_file: str, relation_ids):
     num_rules = 0
     max_rule_id = 0
 
+    print(f"Parsing rule file: {rule_file}")
     with open(rule_file, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             if not line.strip():
@@ -365,11 +366,13 @@ def parse_rule_file_metadata(rule_file: str, relation_ids):
     }
 
 
-def parse_synergy_file(synergy_file: str, rule_relation_by_id):
+def parse_synergy_file(synergy_file: str, rule_relation_by_id, min_synergy=0.01, degree_alpha=0.5, min_supp=5):
     synergy_by_relation = defaultdict(list)
     if not synergy_file or (not os.path.exists(synergy_file)):
         return {}
 
+    print(f"Parsing synergy file: {synergy_file} with min_synergy={min_synergy} and degree_alpha={degree_alpha}")
+    loaded_synergy_count = 0
     seen_pairs = defaultdict(set)
     with open(synergy_file, "r", encoding="utf-8") as f:
         for raw_line in f:
@@ -383,13 +386,17 @@ def parse_synergy_file(synergy_file: str, rule_relation_by_id):
                 continue
 
             try:
+                supp = int(parts[1])
                 lift = float(parts[2])
                 id1 = int(parts[3])
                 id2 = int(parts[4])
             except Exception:
                 continue
 
-            if lift <= 0:
+            if supp < min_supp:
+                continue
+
+            if lift < float(min_synergy):
                 continue
 
             rel1 = rule_relation_by_id.get(id1)
@@ -401,8 +408,31 @@ def parse_synergy_file(synergy_file: str, rule_relation_by_id):
             if (a, b) in seen_pairs[rel1]:
                 continue
             seen_pairs[rel1].add((a, b))
-            synergy_by_relation[rel1].append((a, b, float(lift)))
 
+            synergy_by_relation[rel1].append((a, b, float(lift)))
+            loaded_synergy_count += 1
+
+    # 0.345 -> 0.337 下降很多，不能归一化
+    # 全局 degree 归一化：lift / (da * db) ^ alpha
+    # da/db 在 relation 全部 synergy pair 上统计，且只计算一次（不在 forward 中重复计算）。
+    # _synergy_by_relation = defaultdict(list)
+    # alpha = float(degree_alpha)
+    # for rel, pairs in synergy_by_relation.items():
+    #     degree = defaultdict(int)
+    #     for a, b, _lift in pairs:
+    #         degree[a] += 1
+    #         degree[b] += 1
+
+    #     for a, b, lift in pairs:
+    #         da = max(int(degree[a]), 1)
+    #         db = max(int(degree[b]), 1)
+    #         norm = float((da * db) ** alpha)
+    #         if norm <= 0:
+    #             continue
+    #         _synergy_by_relation[rel].append((a, b, float(lift) / norm))
+    # synergy_by_relation = _synergy_by_relation
+
+    print(f"Loaded {loaded_synergy_count} synergy pairs across {len(synergy_by_relation)} relations")
     return dict(synergy_by_relation)
 
 
@@ -540,7 +570,6 @@ class SurprisalAggregator(nn.Module):
     def __init__(self, relation, sign_constraint=False):
         super().__init__()
         self.sign_constraint = sign_constraint
-        self.m = nn.Softplus()
 
         relation_rule_ids = sorted(rule_map.get(relation, []))
         self.relation_rule_ids = np.array(relation_rule_ids, dtype=np.int64)
@@ -617,19 +646,34 @@ class SurprisalAggregator(nn.Module):
                 synergy_w_all = synergy_w_all**2
 
             synergy_score = torch.zeros((batch_size, 1), dtype=rule_w.dtype, device=local_rules.device)
-            for start in range(0, int(self.num_relation_synergy), pair_chunk):
-                end = min(start + pair_chunk, int(self.num_relation_synergy))
-                a_local = self.synergy_pair_a_local[start:end]
-                b_local = self.synergy_pair_b_local[start:end]
-                pair_active_chunk = active_matrix[:, a_local] & active_matrix[:, b_local]
-                w_chunk = synergy_w_all[start:end].reshape(1, -1)
-                synergy_score = synergy_score + (pair_active_chunk.float() * w_chunk).sum(dim=1, keepdim=True)
+            # 仅遍历当前 batch 中“可能生效”的 synergy 对，避免全量扫描。
+            # 规则：若某 synergy 的两个规则都未在本 batch 的任一样本中出现，则该 synergy 必不生效。
+            active_rules_in_batch = active_matrix.any(dim=0)
+            active_pair_mask = active_rules_in_batch[self.synergy_pair_a_local] & active_rules_in_batch[
+                self.synergy_pair_b_local
+            ]
+            active_pair_idx = torch.nonzero(active_pair_mask, as_tuple=False).reshape(-1)
+
+            if active_pair_idx.numel() > 0:
+                pair_a_active = self.synergy_pair_a_local[active_pair_idx]
+                pair_b_active = self.synergy_pair_b_local[active_pair_idx]
+                synergy_w_active = synergy_w_all[active_pair_idx]
+
+                active_pair_count = int(active_pair_idx.numel())
+                for start in range(0, active_pair_count, pair_chunk):
+                    end = min(start + pair_chunk, active_pair_count)
+                    a_local = pair_a_active[start:end]
+                    b_local = pair_b_active[start:end]
+                    pair_active_chunk = active_matrix[:, a_local] & active_matrix[:, b_local]
+                    w_chunk = synergy_w_active[start:end].reshape(1, -1)
+                    synergy_score = synergy_score + (pair_active_chunk.float() * w_chunk).sum(dim=1, keepdim=True)
             score = score + self.gamma * synergy_score
 
         if self.sign_constraint:
             score = score + self.bias**2
         else:
-            score = self.m(score + self.bias)
+            score = torch.nn.functional.softplus(score + self.bias)
+            # score = torch.clamp(score + self.bias, min=0.0)
         score = 1 - torch.exp(-score)
         score = torch.clamp(score, min=1e-7, max=1 - 1e-7)
         return score
@@ -964,6 +1008,20 @@ def get_parser():
         help="Max number of synergy pairs processed per chunk in SurprisalAggregator forward; reduce to avoid CUDA OOM.",
     )
     parser.add_argument(
+        "--synergy_degree_alpha",
+        action="store",
+        default=0.5,
+        type=float,
+        help="Exponent alpha for global synergy degree normalization: lift / (da*db)^alpha",
+    )
+    parser.add_argument(
+        "--min_synergy",
+        action="store",
+        default=0.01,
+        type=float,
+        help="Filter out synergy pairs whose second column value is below this threshold.",
+    )
+    parser.add_argument(
         "--rule_file",
         action="store",
         default="",
@@ -974,6 +1032,12 @@ def get_parser():
         action="store_true",
         default=False,
         help="Enable positive synergy interactions for SurprisalAggregator.",
+    )
+    parser.add_argument(
+        "--collect_train_hit_counts",
+        action="store_true",
+        default=False,
+        help="Collect per-rule/per-synergy train hit counts for analysis CSVs (can be slow).",
     )
 
     return parser
@@ -1059,10 +1123,18 @@ def aggregate_single(relation):
         raise RuntimeError("GPU-only eval requires CUDA device; please set --device cuda")
 
     relation_rule_ids = sorted(rule_map.get(relation, []))
-    relation_synergy_pairs = []
-    if args.model == "SurprisalAggregator" and args.synergy:
-        relation_synergy_pairs = [(int(a), int(b)) for (a, b, _lift) in sorted(synergy_map.get(relation, []), key=lambda x: (x[0], x[1]))]
-    rule_hit_counts, synergy_hit_counts = compute_train_hit_counts(train_split, relation_rule_ids, relation_synergy_pairs)
+    rule_hit_counts = {}
+    synergy_hit_counts = {}
+    if args.collect_train_hit_counts:
+        relation_synergy_pairs = []
+        if args.model == "SurprisalAggregator" and args.synergy:
+            relation_synergy_pairs = [
+                (int(a), int(b))
+                for (a, b, _lift) in sorted(synergy_map.get(relation, []), key=lambda x: (x[0], x[1]))
+            ]
+        rule_hit_counts, synergy_hit_counts = compute_train_hit_counts(
+            train_split, relation_rule_ids, relation_synergy_pairs
+        )
 
     with torch.no_grad():
         initial_rule_weights = nnm.rules.weight[: nnm.num_relation_rules, 0].detach().cpu().numpy().copy()
@@ -1480,6 +1552,7 @@ test_torch = dataset.split("test")
 valid_sp_to_o = dataset.index("valid_sp_to_o")
 valid_po_to_s = dataset.index("valid_po_to_s")
 
+print("Loading processed explanations...")
 processed_sp_test = pickle.load(open(args.directory_explanations + "processed_sp_test.pkl", "rb"))
 processed_po_test = pickle.load(open(args.directory_explanations + "processed_po_test.pkl", "rb"))
 
@@ -1490,7 +1563,16 @@ rule_file = args.rule_file if args.rule_file else f"./{args.dataset}/rules/rules
 synergy_file = os.path.join(os.path.dirname(rule_file), "synergy.txt")
 relation_ids = read_ids(f"./{args.dataset}/relation_ids.del")
 rule_meta = parse_rule_file_metadata(rule_file, relation_ids)
-synergy_map = parse_synergy_file(synergy_file, rule_meta["rule_relation_by_id"]) if args.synergy else {}
+synergy_map = (
+    parse_synergy_file(
+        synergy_file,
+        rule_meta["rule_relation_by_id"],
+        min_synergy=args.min_synergy,
+        degree_alpha=args.synergy_degree_alpha,
+    )
+    if args.synergy
+    else {}
+)
 
 LEN_RULES = rule_meta["num_rules"]
 MAX_RULE_ID = rule_meta["max_rule_id"]
@@ -1513,6 +1595,7 @@ if EVAL_DEVICE.type == "cpu":
 RULE_CONF_TABLE = RULE_CONF_TABLE_CPU.to(EVAL_DEVICE)
 
 # 优化点：预构建 relation -> keys 索引，避免每次 get_ranks 线性扫描所有 keys。
+print("Building relation key indices...")
 relation_keys = {
     "valid_o": build_relation_key_index(valid_sp_to_o, direction="o"),
     "valid_s": build_relation_key_index(valid_po_to_s, direction="s"),
