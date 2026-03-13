@@ -51,7 +51,10 @@ def map_to_nested_json(data_map: Dict[TripleKey, List[int]]) -> Dict:
 
 
 def split_file(exp_path: Path, split: str) -> Path:
-    return exp_path / f"applied_rules_{split}.json"
+    new_path = exp_path / f"applied_rules_{split}.json"
+    if new_path.exists():
+        return new_path
+    return exp_path / "explanations-processed" / f"applied_rules_{split}.json"
 
 
 def main():
@@ -62,6 +65,7 @@ def main():
         )
     )
     parser.add_argument("-d", "--dataset", default="codex-m", help="Dataset folder name (default: codex-m)")
+    parser.add_argument("--data_root", default="data", help="Dataset root directory")
     parser.add_argument("-a", default="expl.anyburl", help="Experiment A folder name/path")
     parser.add_argument("-p", default="expl.pyclause", help="Experiment P folder name/path")
     parser.add_argument("-o", default="expl.new", help="Output experiment folder name/path")
@@ -74,11 +78,12 @@ def main():
     )
     args = parser.parse_args()
 
-    a_exp = Path(f"/home/sy/2026/canonical/{args.dataset}/{args.a}/explanations-processed")
-    p_exp = Path(f"/home/sy/2026/canonical/{args.dataset}/{args.p}/explanations-processed")
-    out_exp = Path(f"/home/sy/2026/canonical/{args.dataset}/{args.o}/explanations-processed")
-    if not out_exp.parent.exists():
-        out_exp.parent.mkdir(parents=True)
+    dataset_dir = Path(args.data_root) / args.dataset
+    a_exp = dataset_dir / args.a
+    p_exp = dataset_dir / args.p
+    out_exp = dataset_dir / args.o
+    if not out_exp.exists():
+        out_exp.mkdir(parents=True)
 
     print(f"A experiment: {a_exp}")
     print(f"P experiment: {p_exp}")

@@ -939,6 +939,7 @@ def load_dataloaders(dataset_directory, relation):
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--dataset", action="store", help="Name of dataset (libkge)", default="codex-m")
+    parser.add_argument("--data_root", action="store", help="Dataset root directory", default="data")
     parser.add_argument("-dev", "--device", action="store", help="Device cpu/cuda", default="cuda")
     parser.add_argument(
         "--max_worker_dataloader",
@@ -1025,7 +1026,7 @@ def get_parser():
         "--rule_file",
         action="store",
         default="",
-        help="Path to rules file. Default: ./<dataset>/rules/rules-1000",
+        help="Path to rules file. Default: <data_root>/<dataset>/rules/rules-1000",
     )
     parser.add_argument(
         "--synergy",
@@ -1526,11 +1527,12 @@ def aggregate_multiple():
 
 args = get_parser().parse_args()
 EVAL_DEVICE = torch.device(args.device)
-args.directory_explanations = f"./{args.dataset}/expl/explanations-processed/"
-args.directory_preprocessed_datasets = f"./{args.dataset}/datasets/"
+dataset_dir = os.path.join(args.data_root, args.dataset)
+args.directory_explanations = f"./{dataset_dir}/expl/"
+args.directory_preprocessed_datasets = f"./{dataset_dir}/datasets/"
 if "EXPERIMENT_DIR" not in os.environ:
     time = datetime.now().strftime("%m%d-%H%M")
-    os.environ["EXPERIMENT_DIR"] = f"./{args.dataset}/exp-{time}"
+    os.environ["EXPERIMENT_DIR"] = f"./{dataset_dir}/exp-{time}"
 args.experiment = os.environ["EXPERIMENT_DIR"]
 
 # Set up experiment folder
@@ -1559,9 +1561,9 @@ processed_po_test = pickle.load(open(args.directory_explanations + "processed_po
 processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_sp_valid.pkl", "rb"))
 processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
 
-rule_file = args.rule_file if args.rule_file else f"./{args.dataset}/rules/rules-1000"
+rule_file = args.rule_file if args.rule_file else f"./{dataset_dir}/rules/rules-1000"
 synergy_file = os.path.join(os.path.dirname(rule_file), "synergy.txt")
-relation_ids = read_ids(f"./{args.dataset}/relation_ids.del")
+relation_ids = read_ids(f"./{dataset_dir}/relation_ids.del")
 rule_meta = parse_rule_file_metadata(rule_file, relation_ids)
 synergy_map = (
     parse_synergy_file(

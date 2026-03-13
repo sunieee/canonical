@@ -39,6 +39,66 @@ def save(obj, folder, name):
     return name
 
 
+def read_ids(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        raw = f.read().splitlines()
+    return [line.split("\t")[1] for line in raw]
+
+
+def load_applied_rules(path):
+    import json
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_processed_from_applied(applied_rules, entity_id_to_idx, relation_id_to_idx):
+    processed_sp = {}
+    processed_po = {}
+
+    tail_applied = applied_rules.get("tail", {})
+    for rel_raw, source_map in tail_applied.items():
+        if rel_raw not in relation_id_to_idx:
+            continue
+        p_idx = relation_id_to_idx[rel_raw]
+        for s_raw, target_map in source_map.items():
+            if s_raw not in entity_id_to_idx:
+                continue
+            s_idx = entity_id_to_idx[s_raw]
+            key = (s_idx, p_idx)
+            bucket = processed_sp.setdefault(key, {"candidates": [], "rules": []})
+
+            for o_raw, rule_ids in target_map.items():
+                if o_raw not in entity_id_to_idx:
+                    continue
+                o_idx = entity_id_to_idx[o_raw]
+                ids = [int(rid) for rid in rule_ids if int(rid) > 0]
+                bucket["candidates"].append(o_idx)
+                bucket["rules"].append(ids)
+
+    head_applied = applied_rules.get("head", {})
+    for rel_raw, source_map in head_applied.items():
+        if rel_raw not in relation_id_to_idx:
+            continue
+        p_idx = relation_id_to_idx[rel_raw]
+        for o_raw, target_map in source_map.items():
+            if o_raw not in entity_id_to_idx:
+                continue
+            o_idx = entity_id_to_idx[o_raw]
+            key = (p_idx, o_idx)
+            bucket = processed_po.setdefault(key, {"candidates": [], "rules": []})
+
+            for s_raw, rule_ids in target_map.items():
+                if s_raw not in entity_id_to_idx:
+                    continue
+                s_idx = entity_id_to_idx[s_raw]
+                ids = [int(rid) for rid in rule_ids if int(rid) > 0]
+                bucket["candidates"].append(s_idx)
+                bucket["rules"].append(ids)
+
+    return processed_sp, processed_po
+
+
 def build_compact_split(sp_to_o, processed_sp, relation, direction="o"):
     rules_flat = []
     offsets = [0]
@@ -99,22 +159,14 @@ def concat_compact_splits(split_a, split_b):
 def generate_dataset(relation):
     train_set_o = build_compact_split(train_sp_to_o, processed_sp_train, relation)
     train_set_s = build_compact_split(train_po_to_s, processed_po_train, relation, direction="s")
-    valid_set_o = build_compact_split(valid_sp_to_o, processed_sp_valid, relation)
-    valid_set_s = build_compact_split(valid_po_to_s, processed_po_valid, relation, direction="s")
-    test_set_o = build_compact_split(test_sp_to_o, processed_sp_test, relation)
-    test_set_s = build_compact_split(test_po_to_s, processed_po_test, relation, direction="s")
 
     train_set = concat_compact_splits(train_set_o, train_set_s)
-    valid_set = concat_compact_splits(valid_set_o, valid_set_s)
-    test_set = concat_compact_splits(test_set_o, test_set_s)
 
     data_obj = {
         "format": "compact_varlen_int32_v1",
         "pad_tok": int(PAD_TOK),
         "num_rules": int(LEN_RULES),
         "train": train_set,
-        "valid": valid_set,
-        "test": test_set,
     }
 
     if args["output"] is not None:
@@ -126,15 +178,23 @@ def generate_dataset(relation):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Creates datasets for bce")
-    # parser.add_argument("-e", "--explanation", help="Folder containing processed explanations", default=None)
     parser.add_argument("-d", "--dataset", help="Name of the dataset (loaded with libkge)", default="codex-m")
+    parser.add_argument("--data_root", help="Dataset root folder", default="data")
+    parser.add_argument(
+        "--applied_rules",
+        help="Path to applied_rules_train.json",
+        default=None,
+    )
     parser.add_argument("--rule_file", help="Path to rules file", default="")
-    # parser.add_argument("-o", "--output", help="Folder where datasets are written", default="./codex-m/datasets")
+    parser.add_argument("-o", "--output", help="Folder where datasets are written", default=None)
     args = vars(parser.parse_args())
-    args["explanation"] = os.path.join(args["dataset"], "expl", "explanations-processed")
-    args["output"] = os.path.join(args["dataset"], "datasets")
+    dataset_dir = os.path.join(args["data_root"], args["dataset"])
+    if args["applied_rules"] is None:
+        args["applied_rules"] = os.path.join(dataset_dir, "expl", "applied_rules_train.json")
+    if args["output"] is None:
+        args["output"] = os.path.join(dataset_dir, "datasets")
     if args["rule_file"] == "":
-        args["rule_file"] = os.path.join(args["dataset"], "rules", "rules-1000")
+        args["rule_file"] = os.path.join(dataset_dir, "rules", "rules-1000")
 
     c = Config()
     c.set("dataset.name", args["dataset"])
@@ -146,25 +206,17 @@ if __name__ == "__main__":
     train_sp_to_o = dataset.index("train_sp_to_o")
     train_po_to_s = dataset.index("train_po_to_s")
 
-    test_sp_to_o = dataset.index("test_sp_to_o")
-    test_po_to_s = dataset.index("test_po_to_s")
-    test_torch = dataset.split("test")
+    entity_ids = read_ids(os.path.join(dataset_dir, "entity_ids.del"))
+    relation_ids = read_ids(os.path.join(dataset_dir, "relation_ids.del"))
+    entity_id_to_idx = {ent: idx for idx, ent in enumerate(entity_ids)}
+    relation_id_to_idx = {rel: idx for idx, rel in enumerate(relation_ids)}
 
-    valid_sp_to_o = dataset.index("valid_sp_to_o")
-    valid_po_to_s = dataset.index("valid_po_to_s")
-    valid_torch = dataset.split("valid")
-
-    processed_sp_train = pickle.load(open(os.path.join(args["explanation"], "processed_sp_train.pkl"), "rb"))
-    processed_po_train = pickle.load(open(os.path.join(args["explanation"], "processed_po_train.pkl"), "rb"))
-
-    processed_sp_test = pickle.load(open(os.path.join(args["explanation"], "processed_sp_test.pkl"), "rb"))
-    processed_po_test = pickle.load(open(os.path.join(args["explanation"], "processed_po_test.pkl"), "rb"))
-
-    processed_sp_valid = pickle.load(open(os.path.join(args["explanation"], "processed_sp_valid.pkl"), "rb"))
-    processed_po_valid = pickle.load(open(os.path.join(args["explanation"], "processed_po_valid.pkl"), "rb"))
-
-    filter_test = set([tuple(x.tolist()) for x in test_torch])
-    filter_valid = set([tuple(x.tolist()) for x in valid_torch])
+    applied_rules_train = load_applied_rules(args["applied_rules"])
+    processed_sp_train, processed_po_train = build_processed_from_applied(
+        applied_rules_train,
+        entity_id_to_idx,
+        relation_id_to_idx,
+    )
 
     LEN_RULES, MAX_RULE_ID = parse_rule_file_stats(args["rule_file"])
     PAD_TOK = MAX_RULE_ID + 1

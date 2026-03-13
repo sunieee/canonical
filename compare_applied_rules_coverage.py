@@ -16,6 +16,15 @@ def load_json(path: Path):
         return json.load(handle)
 
 
+def resolve_split_file(dataset: str, exp_name: str, split: str, data_root: str) -> Path:
+    base = Path(data_root) / dataset / exp_name
+    new_path = base / f"applied_rules_{split}.json"
+    if new_path.exists():
+        return new_path
+    old_path = base / "explanations-processed" / f"applied_rules_{split}.json"
+    return old_path
+
+
 def iter_entries(data: Dict) -> Iterator[Tuple[TripleKey, List[int]]]:
     for direction, relations in data.items():
         if not isinstance(relations, dict):
@@ -152,11 +161,12 @@ def main():
         default=10,
         help="How many sample mismatches/extras to print",
     )
+    parser.add_argument("--data_root", default="data", help="Dataset root directory")
     args = parser.parse_args()
 
-    a_path = Path(f"/home/sy/2026/canonical/{args.dataset}/{args.a}/explanations-processed/applied_rules_test.json")
-    p_path = Path(f"/home/sy/2026/canonical/{args.dataset}/{args.p}/explanations-processed/applied_rules_test.json")
-    args.report_json = f"/home/sy/2026/canonical/{args.dataset}/{args.a}_vs_{args.p}.json"
+    a_path = resolve_split_file(args.dataset, args.a, "test", args.data_root)
+    p_path = resolve_split_file(args.dataset, args.p, "test", args.data_root)
+    args.report_json = str(Path(args.data_root) / args.dataset / f"{args.a}_vs_{args.p}.json")
 
     print(f"Loading A: {a_path}")
     a_data = load_json(a_path)
