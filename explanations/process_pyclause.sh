@@ -44,6 +44,7 @@ run_split() {
   split="$1"
 
   PATH_TRAINING="${data_dir}train.txt"
+  FILTER_W_DATA=1
   if [ "$split" = "test" ]; then
     PATH_VALID="${data_dir}valid.txt"
     PATH_TEST="${data_dir}test.txt"
@@ -53,14 +54,15 @@ run_split() {
   else
     PATH_VALID="${data_dir}empty.txt"
     PATH_TEST="${data_dir}train.txt"
+    FILTER_W_DATA=0
   fi
 
   APPLIED_RULES_FILE="${processed_explanations_folder}applied_rules_${split}.json"
 
   python "$apply_pyclause_path"  --train "$PATH_TRAINING"  --valid "$PATH_VALID"  --target "$PATH_TEST" --rules "$rule_file" \
     --output "$APPLIED_RULES_FILE" \
-    --max-explanations 200 \
     --topk 100 \
+    --filter-w-data "$FILTER_W_DATA" \
     --worker-threads $worker_threads \
     --aggregation maxplus \
     --min-correct-predictions 5 \

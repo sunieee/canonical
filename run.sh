@@ -9,7 +9,7 @@
 # fb15k-237 wnrr codex-m codex-l YAGO3-10 KG20C
 # wnrr KG20C codex-m
 # fb15k-237 codex-l
-for dataset in fb15k-237 codex-l; do
+for dataset in codex-m; do
     echo "Processing $dataset"
     export dataset=$dataset
     # 用规则生成 explanations
@@ -20,7 +20,7 @@ for dataset in fb15k-237 codex-l; do
         ln -s `pwd`/$dataset $target_dir
     fi
     cd explanations
-    bash process.sh
+    bash process_pyclause.sh
     cd ..
     # python create_explanations.py -d $dataset
 
