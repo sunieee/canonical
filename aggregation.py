@@ -159,6 +159,10 @@ def train(dataloader, model, loss_fn, optimizer, reg=False, num_unseen=0):
 
             train_loss += loss.item()
             n_loss += 1
+            # In dependency-only stage, some batches may not activate any trainable dependency pair.
+            # In that case the loss has no gradient path to parameters, so we skip the optimizer step.
+            if not loss.requires_grad:
+                continue
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -366,37 +370,29 @@ def parse_rule_file_metadata(rule_file: str, relation_ids):
     }
 
 
-def parse_synergy_file(synergy_file: str, rule_relation_by_id, min_synergy=0.01, degree_alpha=0.5, min_supp=5):
-    synergy_by_relation = defaultdict(list)
-    if not synergy_file or (not os.path.exists(synergy_file)):
+def parse_filtered_dependency_file(dependency_file: str, rule_relation_by_id, dependency_type: str):
+    dependency_by_relation = defaultdict(list)
+    if not dependency_file or (not os.path.exists(dependency_file)):
         return {}
 
-    print(f"Parsing synergy file: {synergy_file} with min_synergy={min_synergy} and degree_alpha={degree_alpha}")
-    loaded_synergy_count = 0
+    print(f"Parsing filtered dependency file: {dependency_file} ({dependency_type})")
+    loaded_dependency_count = 0
     seen_pairs = defaultdict(set)
-    with open(synergy_file, "r", encoding="utf-8") as f:
+    with open(dependency_file, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip()
             if not line:
                 continue
             parts = line.split("\t")
-            if len(parts) < 5:
+            if len(parts) < 2:
                 parts = re.split(r"\s+", line)
-            if len(parts) < 5:
+            if len(parts) < 2:
                 continue
 
             try:
-                supp = int(parts[1])
-                lift = float(parts[2])
-                id1 = int(parts[3])
-                id2 = int(parts[4])
+                id1 = int(parts[0])
+                id2 = int(parts[1])
             except Exception:
-                continue
-
-            if supp < min_supp:
-                continue
-
-            if lift < float(min_synergy):
                 continue
 
             rel1 = rule_relation_by_id.get(id1)
@@ -409,112 +405,11 @@ def parse_synergy_file(synergy_file: str, rule_relation_by_id, min_synergy=0.01,
                 continue
             seen_pairs[rel1].add((a, b))
 
-            synergy_by_relation[rel1].append((a, b, float(lift)))
-            loaded_synergy_count += 1
+            dependency_by_relation[rel1].append((a, b, dependency_type))
+            loaded_dependency_count += 1
 
-    # 0.345 -> 0.337 下降很多，不能归一化
-    # 全局 degree 归一化：lift / (da * db) ^ alpha
-    # da/db 在 relation 全部 synergy pair 上统计，且只计算一次（不在 forward 中重复计算）。
-    # _synergy_by_relation = defaultdict(list)
-    # alpha = float(degree_alpha)
-    # for rel, pairs in synergy_by_relation.items():
-    #     degree = defaultdict(int)
-    #     for a, b, _lift in pairs:
-    #         degree[a] += 1
-    #         degree[b] += 1
-
-    #     for a, b, lift in pairs:
-    #         da = max(int(degree[a]), 1)
-    #         db = max(int(degree[b]), 1)
-    #         norm = float((da * db) ** alpha)
-    #         if norm <= 0:
-    #             continue
-    #         _synergy_by_relation[rel].append((a, b, float(lift) / norm))
-    # synergy_by_relation = _synergy_by_relation
-
-    print(f"Loaded {loaded_synergy_count} synergy pairs across {len(synergy_by_relation)} relations")
-    return dict(synergy_by_relation)
-
-
-def prefilter_candidates_by_valid(active_valid, candidates, min_valid):
-    min_valid = int(min_valid)
-    if min_valid <= 0:
-        return list(range(len(candidates)))
-    if len(candidates) == 0 or len(active_valid) == 0:
-        return []
-
-    adj = defaultdict(list)
-    for idx, candidate in enumerate(candidates):
-        a, b = int(candidate[0]), int(candidate[1])
-        adj[a].append((b, idx))
-
-    counts = [0] * len(candidates)
-    keep = [False] * len(candidates)
-    remaining = len(candidates)
-
-    for rs in tqdm(active_valid, total=len(active_valid), desc="prefilter-valid", leave=False):
-        if remaining <= 0:
-            break
-        if len(rs) < 2:
-            continue
-        for a in rs:
-            if a not in adj:
-                continue
-            for b, idx in adj[a]:
-                if keep[idx]:
-                    continue
-                if b in rs:
-                    counts[idx] += 1
-                    if counts[idx] >= min_valid:
-                        keep[idx] = True
-                        remaining -= 1
-
-    return [i for i, k in enumerate(keep) if k]
-
-
-def collect_positive_active_rule_sets_by_relation(split_to_targets, processed, direction="o"):
-    active_rule_sets_by_relation = defaultdict(list)
-    for key, golds in split_to_targets.items():
-        if direction == "o":
-            _e, relation = key
-        else:
-            relation, _e = key
-
-        if key not in processed:
-            continue
-
-        gold_set = set(int(x) for x in golds.tolist())
-        candidates = processed[key].get("candidates", [])
-        rules_per_candidate = processed[key].get("rules", [])
-        for prediction, rule_ids in zip(candidates, rules_per_candidate):
-            if int(prediction) not in gold_set:
-                continue
-            active_rule_sets_by_relation[int(relation)].append(set(int(rid) for rid in rule_ids))
-    return active_rule_sets_by_relation
-
-
-def filter_synergy_map_by_valid(synergy_by_relation, valid_active_rule_sets_by_relation, min_valid):
-    min_valid = int(min_valid)
-    if min_valid <= 0:
-        return synergy_by_relation
-
-    filtered = {}
-    total_before = 0
-    total_after = 0
-    for relation, candidates in synergy_by_relation.items():
-        total_before += len(candidates)
-        active_valid = valid_active_rule_sets_by_relation.get(int(relation), [])
-        keep_idx = prefilter_candidates_by_valid(active_valid, candidates, min_valid)
-        kept = [candidates[i] for i in keep_idx]
-        if len(kept) > 0:
-            filtered[int(relation)] = kept
-        total_after += len(kept)
-
-    print(
-        f"Valid positive prefilter kept {total_after} / {total_before} synergy pairs "
-        f"with min_valid_positive={min_valid}"
-    )
-    return filtered
+    print(f"Loaded {loaded_dependency_count} dependencies across {len(dependency_by_relation)} relations")
+    return dict(dependency_by_relation)
 
 
 def get_ranks(nnm, sp_to_o, processed, relation, direction="o", filter_test=False):
@@ -627,7 +522,7 @@ class LinearAggregator(nn.Module):
 
 
 class SurprisalAggregator(nn.Module):
-    WEIGHT_MIN = 0.0
+    WEIGHT_MIN = -7.0
     WEIGHT_MAX = 7.0
 
     def init_weights(self):
@@ -637,16 +532,18 @@ class SurprisalAggregator(nn.Module):
             confs = confs.clamp(min=0.0, max=1 - 1e-7)
             surprisal = -torch.log(1 - confs)
             self.rules.weight[: self.num_relation_rules] = surprisal
-            if self.num_relation_synergy > 0:
-                synergy_init = torch.tensor(self.relation_synergy_lifts, dtype=torch.float32).reshape(-1, 1)
-                self.synergy.weight[: self.num_relation_synergy] = synergy_init
+            if self.num_relation_dependencies > 0:
+                # With sign constraints we square the raw parameter in forward().
+                # Initializing at exactly 0 would make the dependency gradient stay at 0 forever.
+                if self.sign_constraint:
+                    self.dependencies.weight[: self.num_relation_dependencies].fill_(0.1)
+                else:
+                    self.dependencies.weight[: self.num_relation_dependencies].zero_()
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             self.bias.uniform_(-bound, bound)
-            if hasattr(self, "gamma"):
-                self.gamma.fill_(1.0)
 
-    def __init__(self, relation, sign_constraint=False, relation_synergy=None):
+    def __init__(self, relation, sign_constraint=False, relation_dependencies=None):
         super().__init__()
         self.sign_constraint = sign_constraint
 
@@ -655,12 +552,12 @@ class SurprisalAggregator(nn.Module):
         self.num_relation_rules = len(relation_rule_ids)
         self.pad_local_tok = self.num_relation_rules
 
-        if relation_synergy is None:
-            relation_synergy = []
-        relation_synergy = sorted(relation_synergy, key=lambda x: (x[0], x[1]))
+        if relation_dependencies is None:
+            relation_dependencies = []
+        relation_dependencies = sorted(relation_dependencies, key=lambda x: (x[0], x[1], x[2]))
         local_pairs = []
-        local_lifts = []
         global_pairs_filtered = []
+        dependency_signs = []
 
         self.rules = nn.Embedding(self.num_relation_rules + 1, 1, padding_idx=self.pad_local_tok)
         self.bias = nn.Parameter(torch.zeros(1, 1))
@@ -672,29 +569,33 @@ class SurprisalAggregator(nn.Module):
             )
         self.register_buffer("global_to_local", global_to_local)
 
-        for a, b, lift in relation_synergy:
+        for a, b, dependency_type in relation_dependencies:
             local_a = int(global_to_local[a].item())
             local_b = int(global_to_local[b].item())
             if local_a == self.pad_local_tok or local_b == self.pad_local_tok:
                 continue
             local_pairs.append((local_a, local_b))
-            local_lifts.append(float(lift))
-            global_pairs_filtered.append((int(a), int(b)))
+            global_pairs_filtered.append((int(a), int(b), str(dependency_type)))
+            dependency_signs.append(1.0 if dependency_type == "synergy" else -1.0)
 
-        self.num_relation_synergy = len(local_pairs)
-        self.relation_synergy_lifts = local_lifts
-        self.relation_synergy_pairs_global = global_pairs_filtered
-        self.pad_synergy_tok = self.num_relation_synergy
-        if self.num_relation_synergy > 0:
-            self.synergy = nn.Embedding(self.num_relation_synergy + 1, 1, padding_idx=self.pad_synergy_tok)
-            self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.num_relation_dependencies = len(local_pairs)
+        self.num_relation_synergy = self.num_relation_dependencies
+        self.relation_dependency_pairs_global = global_pairs_filtered
+        self.relation_synergy_pairs_global = [(int(a), int(b)) for a, b, _kind in global_pairs_filtered]
+        self.pad_dependency_tok = self.num_relation_dependencies
+        self.pad_synergy_tok = self.pad_dependency_tok
+        if self.num_relation_dependencies > 0:
+            self.dependencies = nn.Embedding(self.num_relation_dependencies + 1, 1, padding_idx=self.pad_dependency_tok)
             pair_a = torch.tensor([p[0] for p in local_pairs], dtype=torch.long)
             pair_b = torch.tensor([p[1] for p in local_pairs], dtype=torch.long)
+            dependency_sign_t = torch.tensor(dependency_signs, dtype=torch.float32)
         else:
             pair_a = torch.empty((0,), dtype=torch.long)
             pair_b = torch.empty((0,), dtype=torch.long)
+            dependency_sign_t = torch.empty((0,), dtype=torch.float32)
         self.register_buffer("synergy_pair_a_local", pair_a)
         self.register_buffer("synergy_pair_b_local", pair_b)
+        self.register_buffer("dependency_pair_sign", dependency_sign_t)
 
         self.init_weights()
 
@@ -706,7 +607,7 @@ class SurprisalAggregator(nn.Module):
         rule_w.masked_fill_(mask, 0.0)
         score = rule_w.sum(dim=1, keepdim=True)
 
-        if self.num_relation_synergy > 0:
+        if self.num_relation_dependencies > 0:
             batch_size = int(local_rules.shape[0])
             active = ~mask
             active_matrix = torch.zeros(
@@ -717,14 +618,15 @@ class SurprisalAggregator(nn.Module):
 
             pair_chunk = int(getattr(args, "synergy_pair_chunk_size", 0))
             if pair_chunk <= 0:
-                pair_chunk = int(self.num_relation_synergy)
+                pair_chunk = int(self.num_relation_dependencies)
 
-            synergy_w_all = self.synergy.weight[: self.num_relation_synergy, 0]
-            synergy_w_all = torch.clamp(synergy_w_all, min=self.WEIGHT_MIN, max=self.WEIGHT_MAX)
+            dependency_w_all = self.dependencies.weight[: self.num_relation_dependencies, 0]
+            dependency_w_all = torch.clamp(dependency_w_all, min=self.WEIGHT_MIN, max=self.WEIGHT_MAX)
+            if self.sign_constraint:
+                dependency_w_all = (dependency_w_all**2) * self.dependency_pair_sign
 
-            synergy_score = torch.zeros((batch_size, 1), dtype=rule_w.dtype, device=local_rules.device)
-            # 仅遍历当前 batch 中“可能生效”的 synergy 对，避免全量扫描。
-            # 规则：若某 synergy 的两个规则都未在本 batch 的任一样本中出现，则该 synergy 必不生效。
+            dependency_score = torch.zeros((batch_size, 1), dtype=rule_w.dtype, device=local_rules.device)
+            # 仅遍历当前 batch 中“可能生效”的 dependency 对，避免全量扫描。
             active_rules_in_batch = active_matrix.any(dim=0)
             active_pair_mask = active_rules_in_batch[self.synergy_pair_a_local] & active_rules_in_batch[
                 self.synergy_pair_b_local
@@ -734,7 +636,7 @@ class SurprisalAggregator(nn.Module):
             if active_pair_idx.numel() > 0:
                 pair_a_active = self.synergy_pair_a_local[active_pair_idx]
                 pair_b_active = self.synergy_pair_b_local[active_pair_idx]
-                synergy_w_active = synergy_w_all[active_pair_idx]
+                dependency_w_active = dependency_w_all[active_pair_idx]
 
                 active_pair_count = int(active_pair_idx.numel())
                 for start in range(0, active_pair_count, pair_chunk):
@@ -742,10 +644,9 @@ class SurprisalAggregator(nn.Module):
                     a_local = pair_a_active[start:end]
                     b_local = pair_b_active[start:end]
                     pair_active_chunk = active_matrix[:, a_local] & active_matrix[:, b_local]
-                    w_chunk = synergy_w_active[start:end].reshape(1, -1)
-                    synergy_score = synergy_score + (pair_active_chunk.float() * w_chunk).sum(dim=1, keepdim=True)
-            gamma_eff = torch.clamp(self.gamma, min=self.WEIGHT_MIN, max=self.WEIGHT_MAX)
-            score = score + gamma_eff * synergy_score
+                    w_chunk = dependency_w_active[start:end].reshape(1, -1)
+                    dependency_score = dependency_score + (pair_active_chunk.float() * w_chunk).sum(dim=1, keepdim=True)
+            score = score + dependency_score
 
         if self.sign_constraint:
             score = torch.clamp(score + self.bias, min=0.0)
@@ -778,18 +679,18 @@ def build_rule_only_model_for_relation(relation):
     if args.model == "LinearAggregator":
         return LinearAggregator(relation=relation, sign_constraint=args.sign_constraint)
     if args.model == "SurprisalAggregator":
-        return SurprisalAggregator(relation=relation, sign_constraint=args.sign_constraint, relation_synergy=[])
+        return SurprisalAggregator(relation=relation, sign_constraint=args.sign_constraint, relation_dependencies=[])
     raise ValueError(f"Unknown model: {args.model}")
 
 
-def build_synergy_model_for_relation(relation):
+def build_dependency_model_for_relation(relation):
     if args.model == "LinearAggregator":
         return LinearAggregator(relation=relation, sign_constraint=args.sign_constraint)
     if args.model == "SurprisalAggregator":
         return SurprisalAggregator(
             relation=relation,
             sign_constraint=args.sign_constraint,
-            relation_synergy=synergy_map.get(relation, []),
+            relation_dependencies=dependency_map.get(relation, []),
         )
     raise ValueError(f"Unknown model: {args.model}")
 
@@ -801,7 +702,6 @@ class MRR:
         self.model_builder = model_builder if model_builder is not None else build_rule_only_model_for_relation
 
         self.best_hps = None
-        self.best_hps_raw = None
 
         # Use -1 so the first eval checkpoint is always accepted,
         # even when metric values can be exactly 0.
@@ -820,7 +720,6 @@ class MRR:
         self.test_sp_to_o = test_sp_to_o if direction == "o" else test_po_to_s
         self.test_processed = processed_sp_test if direction == "o" else processed_po_test
         self.nnm = None
-        self.nnm_raw = None
 
     def calc_metrics_(self, ranks, n):
         if n == 0:
@@ -837,56 +736,6 @@ class MRR:
         mrr_raw, h1_raw, h10_raw = self.calc_metrics_(ranks_raw, n)
         return (mrr, h1, h10, mrr_raw, h1_raw, h10_raw)
 
-    def update(self, nnm, hps):
-        has_non_finite = False
-        for _name, p in nnm.named_parameters():
-            if not torch.isfinite(p).all():
-                has_non_finite = True
-                break
-        if has_non_finite:
-            print(f"[WARN] relation={self.relation} direction={self.direction}: non-finite params on valid eval, skip update")
-            return
-
-        (v_mrr, v_h1, v_h10, v_mrr_raw, v_h1_raw, v_h10_raw) = self.calc_metrics(
-            nnm, self.valid_sp_to_o, self.valid_processed, direction=self.direction, filter_test=True
-        )
-        if v_mrr > self.maximums_v:
-            self.maximums_v = v_mrr
-            self.nnm = {k: v.detach().cpu().clone() for k, v in nnm.state_dict().items()}
-            self.best_hps = hps
-
-        if v_mrr_raw > self.maximums_v_raw:
-            self.maximums_v_raw = v_mrr_raw
-            self.nnm_raw = {k: v.detach().cpu().clone() for k, v in nnm.state_dict().items()}
-            self.best_hps_raw = hps
-
-    def finalize_test(self):
-        # 只在训练结束后对 best-valid checkpoint 跑一次 test，减少评估调用次数。
-        if self.nnm is not None:
-            model_for_test = self.model_builder(self.relation)
-            model_for_test.load_state_dict(self.nnm, strict=True)
-            model_for_test = model_for_test.to(args.device)
-            (t_mrr, t_h1, t_h10, _, _, _) = self.calc_metrics(
-                model_for_test, self.test_sp_to_o, self.test_processed, direction=self.direction
-            )
-            self.maximums_t = t_mrr
-            self.maximums_t_1 = t_h1
-            self.maximums_t_10 = t_h10
-            del model_for_test
-
-        if self.nnm_raw is not None:
-            model_for_test_raw = self.model_builder(self.relation)
-            model_for_test_raw.load_state_dict(self.nnm_raw, strict=True)
-            model_for_test_raw = model_for_test_raw.to(args.device)
-            (_, _, _, t_mrr_raw, t_h1_raw, t_h10_raw) = self.calc_metrics(
-                model_for_test_raw, self.test_sp_to_o, self.test_processed, direction=self.direction
-            )
-            self.maximums_t_raw = t_mrr_raw
-            self.maximums_t_1_raw = t_h1_raw
-            self.maximums_t_10_raw = t_h10_raw
-            del model_for_test_raw
-
-
 def compact_mrr_for_save(mrr_obj):
     mrr_light = copy.copy(mrr_obj)
 
@@ -902,11 +751,6 @@ def compact_mrr_for_save(mrr_obj):
             mrr_light.nnm = {k: v.detach().cpu().clone() for k, v in mrr_light.nnm.items()}
         else:
             mrr_light.nnm = {k: v.detach().cpu() for k, v in mrr_light.nnm.state_dict().items()}
-    if mrr_light.nnm_raw is not None:
-        if isinstance(mrr_light.nnm_raw, dict):
-            mrr_light.nnm_raw = {k: v.detach().cpu().clone() for k, v in mrr_light.nnm_raw.items()}
-        else:
-            mrr_light.nnm_raw = {k: v.detach().cpu() for k, v in mrr_light.nnm_raw.state_dict().items()}
 
     return mrr_light
 
@@ -1106,28 +950,7 @@ def get_parser():
         action="store",
         default=32768,
         type=int,
-        help="Max number of synergy pairs processed per chunk in SurprisalAggregator forward; reduce to avoid CUDA OOM.",
-    )
-    parser.add_argument(
-        "--synergy_degree_alpha",
-        action="store",
-        default=0.5,
-        type=float,
-        help="Exponent alpha for global synergy degree normalization: lift / (da*db)^alpha",
-    )
-    parser.add_argument(
-        "--min_synergy",
-        action="store",
-        default=0.01,
-        type=float,
-        help="Filter out synergy pairs whose second column value is below this threshold.",
-    )
-    parser.add_argument(
-        "--synergy_min_valid_positive",
-        action="store",
-        default=4,
-        type=int,
-        help="Keep a synergy pair only if it appears in more than this many valid positive examples.",
+        help="Max number of dependency pairs processed per chunk in SurprisalAggregator forward; reduce to avoid CUDA OOM.",
     )
     parser.add_argument(
         "--rule_file",
@@ -1139,13 +962,19 @@ def get_parser():
         "--synergy",
         action="store_true",
         default=False,
-        help="Enable positive synergy interactions for SurprisalAggregator.",
+        help="Load dependencies from synergy_filtered.txt for SurprisalAggregator.",
+    )
+    parser.add_argument(
+        "--redundancy",
+        action="store_true",
+        default=False,
+        help="Load dependencies from redundancy_filtered.txt for SurprisalAggregator.",
     )
     parser.add_argument(
         "--collect_train_hit_counts",
         action="store_true",
         default=False,
-        help="Collect per-rule/per-synergy train hit counts for analysis CSVs (can be slow).",
+        help="Collect per-rule/per-dependency train hit counts for analysis CSVs (can be slow).",
     )
 
     return parser
@@ -1224,6 +1053,8 @@ def copy_rule_state_from_model(src_model, dst_model):
 def freeze_rule_parameters_for_synergy_stage(model):
     if hasattr(model, "rules"):
         model.rules.weight.requires_grad_(False)
+    if hasattr(model, "bias"):
+        model.bias.requires_grad_(False)
 
 
 def build_optimizer_for_model(model, lr):
@@ -1277,6 +1108,36 @@ def run_training_stage(relation, model, model_builder, dataloader, loss_fn, pos,
     eval_seconds = 0.0
     final_loss = None
     evaluate_every = eval_every_values[0]
+    best_state = None
+    best_head_valid = None
+    best_tail_valid = None
+    best_valid_epoch = None
+
+    # Evaluate the untrained starting point as a valid checkpoint candidate.
+    has_non_finite = False
+    for _name, p in model.named_parameters():
+        if not torch.isfinite(p).all():
+            has_non_finite = True
+            break
+    if has_non_finite:
+        print(f"[WARN] relation={relation} stage={stage_name}: non-finite params at init valid eval, skip init checkpoint")
+    else:
+        eval_start = perf_counter()
+        with step_timer("epoch0_eval_head"):
+            init_head_valid = head_mrr.calc_metrics(
+                model, head_mrr.valid_sp_to_o, head_mrr.valid_processed, direction=head_mrr.direction, filter_test=True
+            )
+        with step_timer("epoch0_eval_tail"):
+            init_tail_valid = tail_mrr.calc_metrics(
+                model, tail_mrr.valid_sp_to_o, tail_mrr.valid_processed, direction=tail_mrr.direction, filter_test=True
+            )
+        eval_seconds += perf_counter() - eval_start
+
+        best_valid_combined_raw = (init_head_valid[3] + init_tail_valid[3]) / 2.0
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        best_head_valid = init_head_valid
+        best_tail_valid = init_tail_valid
+        best_valid_epoch = 0
 
     pbar = tqdm(range(max_epoch), desc=f"r{relation}-{stage_name}", leave=False)
     for t in pbar:
@@ -1299,21 +1160,39 @@ def run_training_stage(relation, model, model_builder, dataloader, loss_fn, pos,
         do_eval = do_eval_in_phase or (t == max_epoch - 1)
 
         if do_eval:
+            has_non_finite = False
+            for _name, p in model.named_parameters():
+                if not torch.isfinite(p).all():
+                    has_non_finite = True
+                    break
+
             eval_start = perf_counter()
-            with step_timer("epoch_eval_head"):
-                head_mrr.update(model, (pos, float(current_lr), t))
-            with step_timer("epoch_eval_tail"):
-                tail_mrr.update(model, (pos, float(current_lr), t))
+            if has_non_finite:
+                print(f"[WARN] relation={relation} stage={stage_name}: non-finite params on valid eval, skip update")
+            else:
+                with step_timer("epoch_eval_head"):
+                    current_head_valid = head_mrr.calc_metrics(
+                        model, head_mrr.valid_sp_to_o, head_mrr.valid_processed, direction=head_mrr.direction, filter_test=True
+                    )
+                with step_timer("epoch_eval_tail"):
+                    current_tail_valid = tail_mrr.calc_metrics(
+                        model, tail_mrr.valid_sp_to_o, tail_mrr.valid_processed, direction=tail_mrr.direction, filter_test=True
+                    )
             eval_seconds += perf_counter() - eval_start
 
-            valid_combined_raw = (head_mrr.maximums_v_raw + tail_mrr.maximums_v_raw) / 2.0
-            if valid_combined_raw > best_valid_combined_raw:
-                best_valid_combined_raw = valid_combined_raw
-                no_improve_eval_rounds = 0
-            else:
-                no_improve_eval_rounds += 1
+            if not has_non_finite:
+                valid_combined_raw = (current_head_valid[3] + current_tail_valid[3]) / 2.0
+                if valid_combined_raw > best_valid_combined_raw:
+                    best_valid_combined_raw = valid_combined_raw
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    best_head_valid = current_head_valid
+                    best_tail_valid = current_tail_valid
+                    best_valid_epoch = int(t + 1)
+                    no_improve_eval_rounds = 0
+                else:
+                    no_improve_eval_rounds += 1
 
-            if early_stopping_patience > 0 and no_improve_eval_rounds >= early_stopping_patience:
+            if (not has_non_finite) and early_stopping_patience > 0 and no_improve_eval_rounds >= early_stopping_patience:
                 pbar.set_postfix(
                     loss=f"{final_loss:.5f}",
                     max_mrr=f"{valid_combined_raw:.5f}",
@@ -1321,13 +1200,44 @@ def run_training_stage(relation, model, model_builder, dataloader, loss_fn, pos,
                 )
                 break
 
-        max_mrr = (tail_mrr.maximums_v_raw + head_mrr.maximums_v_raw) / 2.0
+        max_mrr = max(best_valid_combined_raw, 0.0)
         pbar.set_postfix(loss=f"{final_loss:.5f}", max_mrr=f"{max_mrr:.5f}")
 
+    if best_state is None or best_head_valid is None or best_tail_valid is None:
+        raise RuntimeError(f"No valid checkpoint selected for relation {relation} at stage {stage_name}")
+
+    model.load_state_dict(best_state, strict=True)
+    head_mrr.nnm = {k: v.detach().cpu().clone() for k, v in best_state.items()}
+    tail_mrr.nnm = {k: v.detach().cpu().clone() for k, v in best_state.items()}
+
+    head_mrr.maximums_v, head_mrr.maximums_v_raw = float(best_head_valid[0]), float(best_head_valid[3])
+    tail_mrr.maximums_v, tail_mrr.maximums_v_raw = float(best_tail_valid[0]), float(best_tail_valid[3])
+
     with step_timer("epoch_eval_head"):
-        head_mrr.finalize_test()
+        head_test = head_mrr.calc_metrics(model, head_mrr.test_sp_to_o, head_mrr.test_processed, direction=head_mrr.direction)
     with step_timer("epoch_eval_tail"):
-        tail_mrr.finalize_test()
+        tail_test = tail_mrr.calc_metrics(model, tail_mrr.test_sp_to_o, tail_mrr.test_processed, direction=tail_mrr.direction)
+
+    head_mrr.maximums_t, head_mrr.maximums_t_1, head_mrr.maximums_t_10 = (
+        float(head_test[0]),
+        float(head_test[1]),
+        float(head_test[2]),
+    )
+    head_mrr.maximums_t_raw, head_mrr.maximums_t_1_raw, head_mrr.maximums_t_10_raw = (
+        float(head_test[3]),
+        float(head_test[4]),
+        float(head_test[5]),
+    )
+    tail_mrr.maximums_t, tail_mrr.maximums_t_1, tail_mrr.maximums_t_10 = (
+        float(tail_test[0]),
+        float(tail_test[1]),
+        float(tail_test[2]),
+    )
+    tail_mrr.maximums_t_raw, tail_mrr.maximums_t_1_raw, tail_mrr.maximums_t_10_raw = (
+        float(tail_test[3]),
+        float(tail_test[4]),
+        float(tail_test[5]),
+    )
 
     final_test = {
         "mrr": float(calc_mrr(tail_mrr, head_mrr)[0]),
@@ -1349,11 +1259,30 @@ def run_training_stage(relation, model, model_builder, dataloader, loss_fn, pos,
         "train_seconds": float(train_seconds),
         "eval_seconds": float(eval_seconds),
         "evaluate_every": int(evaluate_every),
+        "best_valid_epoch": None if best_valid_epoch is None else int(best_valid_epoch),
         "best_valid_combined_raw": float(best_valid_combined_raw),
     }
 
 
 def aggregate_single(relation):
+    def build_best_valid_metrics(stage_result):
+        if stage_result is None:
+            return None
+
+        stage_head_mrr = stage_result["head_mrr"]
+        stage_tail_mrr = stage_result["tail_mrr"]
+        best_valid_mrr, best_valid_mrr_raw = calc_mrr(stage_tail_mrr, stage_head_mrr, "maximums_v")
+        return {
+            "mrr": float(best_valid_mrr),
+            "mrr_raw": float(best_valid_mrr_raw),
+            "head_mrr": float(stage_head_mrr.maximums_v),
+            "tail_mrr": float(stage_tail_mrr.maximums_v),
+            "head_mrr_raw": float(stage_head_mrr.maximums_v_raw),
+            "tail_mrr_raw": float(stage_tail_mrr.maximums_v_raw),
+            "combined_raw": float(stage_result["best_valid_combined_raw"]),
+            "epoch": None if stage_result["best_valid_epoch"] is None else int(stage_result["best_valid_epoch"]),
+        }
+
     relation_start_time = perf_counter()
     load_start_time = perf_counter()
     dataloader, train_split = load_dataloaders(args.directory_preprocessed_datasets, relation)
@@ -1399,74 +1328,94 @@ def aggregate_single(relation):
     )
 
     final_result = stage1_result
+    dependency_stage_result = None
+    dependency_stage_accepted = None
+    selection_reason = "rule stage only"
     stage1_metrics = {
         "epochs_trained": int(stage1_result["epochs_trained"]),
         "evaluate_every": int(stage1_result["evaluate_every"]),
+        "best_valid_epoch": int(stage1_result["best_valid_epoch"]),
         "best_valid_combined_raw": float(stage1_result["best_valid_combined_raw"]),
     }
     stage2_metrics = None
-    initial_gamma_value = None
-    initial_synergy_weights = np.array([], dtype=np.float32)
-    synergy_pairs = []
+    initial_dependency_weights = np.array([], dtype=np.float32)
+    dependency_pairs = []
     test_stage_2 = stage1_result["test"]
     test_stage_3 = None
 
-    if args.model == "SurprisalAggregator" and args.synergy:
-        synergy_model = build_synergy_model_for_relation(relation)
-        copy_rule_state_from_model(stage1_result["model"], synergy_model)
-        freeze_rule_parameters_for_synergy_stage(synergy_model)
-        synergy_model = synergy_model.to(args.device)
+    if args.model == "SurprisalAggregator" and (args.synergy or args.redundancy):
+        dependency_model = build_dependency_model_for_relation(relation)
+        copy_rule_state_from_model(stage1_result["model"], dependency_model)
+        freeze_rule_parameters_for_synergy_stage(dependency_model)
+        dependency_model = dependency_model.to(args.device)
 
-        synergy_pairs = list(getattr(synergy_model, "relation_synergy_pairs_global", []))
-        if getattr(synergy_model, "num_relation_synergy", 0) > 0:
+        dependency_pairs = list(getattr(dependency_model, "relation_dependency_pairs_global", []))
+        if getattr(dependency_model, "num_relation_dependencies", 0) > 0:
             with torch.no_grad():
-                initial_synergy_weights = (
-                    synergy_model.synergy.weight[: synergy_model.num_relation_synergy, 0].detach().cpu().numpy().copy()
+                initial_dependency_weights = (
+                    dependency_model.dependencies.weight[: dependency_model.num_relation_dependencies, 0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .copy()
                 )
-                initial_gamma_value = (
-                    float(synergy_model.gamma.detach().reshape(-1)[0].cpu().item()) if hasattr(synergy_model, "gamma") else None
-                )
-            test_stage_3 = evaluate_model_on_test(relation, synergy_model, build_synergy_model_for_relation)
+            test_stage_3 = evaluate_model_on_test(relation, dependency_model, build_dependency_model_for_relation)
 
-            final_result = run_training_stage(
+            dependency_stage_result = run_training_stage(
                 relation=relation,
-                model=synergy_model,
-                model_builder=build_synergy_model_for_relation,
+                model=dependency_model,
+                model_builder=build_dependency_model_for_relation,
                 dataloader=train_dataloader,
                 loss_fn=loss_fn,
                 pos=pos,
                 lr_values=lr_values,
                 eval_every_values=eval_every_values,
                 max_epoch=max_epoch,
-                stage_name="synergy",
+                stage_name="dependency",
             )
             stage2_metrics = {
-                "epochs_trained": int(final_result["epochs_trained"]),
-                "evaluate_every": int(final_result["evaluate_every"]),
-                "best_valid_combined_raw": float(final_result["best_valid_combined_raw"]),
+                "epochs_trained": int(dependency_stage_result["epochs_trained"]),
+                "evaluate_every": int(dependency_stage_result["evaluate_every"]),
+                "best_valid_epoch": int(dependency_stage_result["best_valid_epoch"]),
+                "best_valid_combined_raw": float(dependency_stage_result["best_valid_combined_raw"]),
             }
+
+            rule_best_valid_combined_raw = float(stage1_result["best_valid_combined_raw"])
+            dependency_best_valid_combined_raw = float(dependency_stage_result["best_valid_combined_raw"])
+            dependency_stage_accepted = dependency_best_valid_combined_raw > rule_best_valid_combined_raw
+            if dependency_stage_accepted:
+                final_result = dependency_stage_result
+                selection_reason = "accepted dependency stage because its best valid combined raw exceeded the rule-only stage"
+            else:
+                final_result = stage1_result
+                selection_reason = "rejected dependency stage because its best valid combined raw did not exceed the rule-only stage"
         else:
             final_result = stage1_result
+            dependency_stage_accepted = False
+            selection_reason = "rejected dependency stage because no relation-local dependency pairs remained after filtering"
 
     nnm = final_result["model"]
     head_mrr = final_result["head_mrr"]
     tail_mrr = final_result["tail_mrr"]
     evaluate_every = final_result["evaluate_every"]
     epochs_trained = final_result["epochs_trained"]
-    train_seconds = stage1_result["train_seconds"] + (0.0 if final_result is stage1_result else final_result["train_seconds"])
-    eval_seconds = stage1_result["eval_seconds"] + (0.0 if final_result is stage1_result else final_result["eval_seconds"])
-    best_valid_combined_raw = final_result["best_valid_combined_raw"]
-    test_stage_4 = final_result["test"]
+    train_seconds = stage1_result["train_seconds"] + (
+        0.0 if dependency_stage_result is None else dependency_stage_result["train_seconds"]
+    )
+    eval_seconds = stage1_result["eval_seconds"] + (
+        0.0 if dependency_stage_result is None else dependency_stage_result["eval_seconds"]
+    )
+    test_stage_4 = final_result["test"] if dependency_stage_result is None else dependency_stage_result["test"]
 
     mrr, mrr_raw = calc_mrr(tail_mrr, head_mrr)
     h1, h1_raw = calc_mrr(tail_mrr, head_mrr, "maximums_t_1")
     h10, h10_raw = calc_mrr(tail_mrr, head_mrr, "maximums_t_10")
 
     rule_hit_counts = {}
-    synergy_hit_counts = {}
+    dependency_hit_counts = {}
     if args.collect_train_hit_counts:
-        relation_synergy_pairs = list(getattr(nnm, "relation_synergy_pairs_global", []))
-        rule_hit_counts, synergy_hit_counts = compute_train_hit_counts(
+        relation_synergy_pairs = [(int(a), int(b)) for (a, b, _kind) in dependency_pairs]
+        rule_hit_counts, dependency_hit_counts = compute_train_hit_counts(
             train_split, relation_rule_ids, relation_synergy_pairs
         )
 
@@ -1483,24 +1432,46 @@ def aggregate_single(relation):
             )
             )
 
-    learned_synergy_weights = []
-    if args.model == "SurprisalAggregator" and len(synergy_pairs) > 0 and getattr(nnm, "num_relation_synergy", 0) > 0:
+    learned_dependency_weights = []
+    dependency_weights_model = dependency_stage_result["model"] if dependency_stage_result is not None else None
+    if (
+        args.model == "SurprisalAggregator"
+        and dependency_weights_model is not None
+        and len(dependency_pairs) > 0
+        and getattr(dependency_weights_model, "num_relation_dependencies", 0) > 0
+    ):
         with torch.no_grad():
-            trained_synergy_weights = nnm.synergy.weight[: nnm.num_relation_synergy, 0].detach().cpu().numpy()
-        learned_synergy_weights = [
-            (int(a), int(b), round(float(o), 7), round(float(t), 7), int(synergy_hit_counts.get((int(a), int(b)), 0)))
-            for (a, b), o, t in zip(synergy_pairs, initial_synergy_weights.tolist(), trained_synergy_weights.tolist())
+            trained_dependency_weights = (
+                dependency_weights_model.dependencies.weight[: dependency_weights_model.num_relation_dependencies, 0]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        learned_dependency_weights = [
+            (
+                int(a),
+                int(b),
+                str(kind),
+                round(float(o), 7),
+                round(float(t), 7),
+                round(float(((o**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint else o), 7),
+                round(float(((t**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint else t), 7),
+                int(dependency_hit_counts.get((int(a), int(b)), 0)),
+            )
+            for (a, b, kind), o, t in zip(
+                dependency_pairs, initial_dependency_weights.tolist(), trained_dependency_weights.tolist()
+            )
         ]
 
     with torch.no_grad():
         trained_bias_value = float(nnm.bias.detach().reshape(-1)[0].cpu().item()) if hasattr(nnm, "bias") else None
-        trained_gamma_value = float(nnm.gamma.detach().reshape(-1)[0].cpu().item()) if hasattr(nnm, "gamma") else None
 
     num_test_samples = int(test_torch[test_torch[:, 1] == relation].shape[0])
     num_relation_rules = int(len(relation_rule_ids))
-    num_relation_synergy = int(len(synergy_map.get(relation, [])))
+    num_relation_dependencies = int(len(dependency_map.get(relation, [])))
 
-    best_valid_mrr, best_valid_mrr_raw = calc_mrr(tail_mrr, head_mrr, "maximums_v")
+    best_valid_stage1 = build_best_valid_metrics(stage1_result)
+    best_valid_stage2 = build_best_valid_metrics(dependency_stage_result)
     relation_total_seconds = perf_counter() - relation_start_time
     other_seconds = relation_total_seconds - load_seconds - train_seconds - eval_seconds
     if other_seconds < 0:
@@ -1510,15 +1481,16 @@ def aggregate_single(relation):
         "relation": int(relation),
         "num_test_samples": num_test_samples,
         "num_relation_rules": num_relation_rules,
-        "num_relation_synergy": num_relation_synergy,
-        "num_relation_features": int(num_relation_rules + num_relation_synergy),
+        "num_relation_synergy": num_relation_dependencies,
+        "num_relation_dependencies": num_relation_dependencies,
+        "num_relation_features": int(num_relation_rules + num_relation_dependencies),
         "train": {
             "max_epoch": int(max_epoch),
             "epochs_trained": int(epochs_trained),
             "evaluate_every": int(evaluate_every),
             "early_stopping_patience_eval_rounds": int(early_stopping_patience),
             "stage1_rule_only": stage1_metrics,
-            "stage2_synergy_only": stage2_metrics,
+            "stage2_dependency_only": stage2_metrics,
         },
         "time_seconds": {
             "total": float(relation_total_seconds),
@@ -1527,30 +1499,32 @@ def aggregate_single(relation):
             "eval": float(eval_seconds),
             "other": float(other_seconds),
         },
-        "best_valid": {
-            "mrr": float(best_valid_mrr),
-            "mrr_raw": float(best_valid_mrr_raw),
-            "head_mrr": float(head_mrr.maximums_v),
-            "tail_mrr": float(tail_mrr.maximums_v),
-            "head_mrr_raw": float(head_mrr.maximums_v_raw),
-            "tail_mrr_raw": float(tail_mrr.maximums_v_raw),
-            "combined_raw": float(best_valid_combined_raw),
+        "best_valid_stage1": best_valid_stage1,
+        "best_valid_stage2": best_valid_stage2,
+        "model_selection": {
+            "selected_stage": (
+                "dependency" if (dependency_stage_result is not None and final_result is dependency_stage_result) else "rule_only"
+            ),
+            "dependency_stage_attempted": bool(dependency_stage_result is not None),
+            "dependency_stage_accepted": (
+                None if dependency_stage_result is None else bool(dependency_stage_accepted)
+            ),
+            "rule_best_valid_combined_raw": float(stage1_result["best_valid_combined_raw"]),
+            "dependency_best_valid_combined_raw": (
+                None if dependency_stage_result is None else float(dependency_stage_result["best_valid_combined_raw"])
+            ),
+            "reason": selection_reason,
         },
         "params": {
             "bias": {
                 "original": initial_bias_value,
                 "trained": trained_bias_value,
             },
-            "gamma": {
-                "original": initial_gamma_value,
-                "trained": trained_gamma_value,
-            },
         },
-        "test_stage_1_rule_init": test_stage_1,
-        "test_stage_2_rule_trained": test_stage_2,
-        "test_stage_3_synergy_init": test_stage_3,
-        "test_stage_4_synergy_trained": test_stage_4,
-        "test_initial": test_stage_1,
+        "test_before_stage1": test_stage_1,
+        "test_after_stage1": test_stage_2,
+        "test_before_stage2": test_stage_3,
+        "test_after_stage2": None if dependency_stage_result is None else test_stage_4,
         "test": {
             "mrr": float(mrr),
             "h1": float(h1),
@@ -1571,19 +1545,34 @@ def aggregate_single(relation):
             writer.writerow(["ruleID", "original", "trained", "train_hit_count"])
             writer.writerows(learned_weights)
 
-        if len(learned_synergy_weights) > 0:
-            with open(f"{args.experiment}/synergy-{relation}.csv", "w", newline="") as f:
+        if len(learned_dependency_weights) > 0:
+            with open(f"{args.experiment}/dependency-{relation}.csv", "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["rule1ID", "rule2ID", "original", "trained", "train_hit_count"])
-                writer.writerows(learned_synergy_weights)
+                writer.writerow(
+                    [
+                        "rule1ID",
+                        "rule2ID",
+                        "type",
+                        "raw_original",
+                        "raw_trained",
+                        "effective_original",
+                        "effective_trained",
+                        "train_hit_count",
+                    ]
+                )
+                writer.writerows(learned_dependency_weights)
 
     # 显式释放 relation 级别对象，尽量降低长跑时显存峰值。
     del train_dataloader, dataloader, train_split
     del loss_fn, nnm
     del head_mrr, tail_mrr
-    if "stage1_result" in locals():
+    has_stage1_result = "stage1_result" in locals()
+    has_final_result = "final_result" in locals()
+    final_result_differs = has_stage1_result and has_final_result and (final_result is not stage1_result)
+
+    if has_stage1_result:
         del stage1_result
-    if "final_result" in locals() and final_result is not stage1_result:
+    if final_result_differs:
         del final_result
     gc.collect()
     if torch.cuda.is_available() and str(args.device).startswith("cuda"):
@@ -1604,10 +1593,10 @@ def _get_relation_test_counts():
 
 def _merge_metric_files(metric_files, relation_test_counts):
     rows_by_stage = {
-        "test_stage_1_rule_init": [],
-        "test_stage_2_rule_trained": [],
-        "test_stage_3_synergy_init": [],
-        "test_stage_4_synergy_trained": [],
+        "test_before_stage1": [],
+        "test_after_stage1": [],
+        "test_before_stage2": [],
+        "test_after_stage2": [],
     }
 
     def append_stage_row(stage_key, metrics_obj, relation, count):
@@ -1631,12 +1620,32 @@ def _merge_metric_files(metric_files, relation_test_counts):
             m = json.load(f)
         relation = int(m["relation"])
         count = relation_test_counts.get(relation, 0)
-        append_stage_row("test_stage_1_rule_init", m.get("test_stage_1_rule_init", m.get("test_initial")), relation, count)
-        append_stage_row("test_stage_2_rule_trained", m.get("test_stage_2_rule_trained"), relation, count)
-        append_stage_row("test_stage_3_synergy_init", m.get("test_stage_3_synergy_init"), relation, count)
-        append_stage_row("test_stage_4_synergy_trained", m.get("test_stage_4_synergy_trained", m.get("test")), relation, count)
+        append_stage_row(
+            "test_before_stage1",
+            m.get("test_before_stage1", m.get("test_stage_1_rule_init", m.get("test_initial"))),
+            relation,
+            count,
+        )
+        append_stage_row(
+            "test_after_stage1",
+            m.get("test_after_stage1", m.get("test_stage_2_rule_trained")),
+            relation,
+            count,
+        )
+        append_stage_row(
+            "test_before_stage2",
+            m.get("test_before_stage2", m.get("test_stage_3_synergy_init")),
+            relation,
+            count,
+        )
+        append_stage_row(
+            "test_after_stage2",
+            m.get("test_after_stage2", m.get("test_stage_4_synergy_trained")),
+            relation,
+            count,
+        )
 
-    if not rows_by_stage["test_stage_4_synergy_trained"] and not rows_by_stage["test_stage_2_rule_trained"]:
+    if not rows_by_stage["test_after_stage2"] and not rows_by_stage["test_after_stage1"]:
         return {
             "num_relations": 0,
             "macro": {},
@@ -1656,18 +1665,17 @@ def _merge_metric_files(metric_files, relation_test_counts):
             }
         else:
             weighted_by_stage[stage_key] = None
-        if stage_key in ["test_stage_2_rule_trained", "test_stage_4_synergy_trained"] and stage_total_weight > total_weight:
+        if stage_key in ["test_after_stage1", "test_after_stage2"] and stage_total_weight > total_weight:
             total_weight = stage_total_weight
         num_relations = max(num_relations, len(stage_rows))
 
     return {
         "num_relations": int(num_relations),
-        "test_stage_1_rule_init": weighted_by_stage["test_stage_1_rule_init"],
-        "test_stage_2_rule_trained": weighted_by_stage["test_stage_2_rule_trained"],
-        "test_stage_3_synergy_init": weighted_by_stage["test_stage_3_synergy_init"],
-        "test_stage_4_synergy_trained": weighted_by_stage["test_stage_4_synergy_trained"],
-        "test_initial": weighted_by_stage["test_stage_1_rule_init"],
-        "test": weighted_by_stage["test_stage_4_synergy_trained"] or weighted_by_stage["test_stage_2_rule_trained"],
+        "test_before_stage1": weighted_by_stage["test_before_stage1"],
+        "test_after_stage1": weighted_by_stage["test_after_stage1"],
+        "test_before_stage2": weighted_by_stage["test_before_stage2"],
+        "test_after_stage2": weighted_by_stage["test_after_stage2"],
+        "test": weighted_by_stage["test_after_stage2"] or weighted_by_stage["test_after_stage1"],
         "total_test_triples_used_for_weight": int(total_weight),
     }
 
@@ -1764,8 +1772,8 @@ args.directory_explanations = f"./{dataset_dir}/expl/"
 args.directory_preprocessed_datasets = f"./{dataset_dir}/datasets/"
 if "EXPERIMENT_DIR" not in os.environ:
     sign_bit = 1 if args.sign_constraint else 0
-    synergy_bit = 1 if args.synergy else 0
-    exp_name = f"exp{args.relation}_{args.model}_{sign_bit}_{synergy_bit}"
+    dependency_bit = 1 if (args.synergy or args.redundancy) else 0
+    exp_name = f"exp{args.relation}_{args.model}_{sign_bit}_{int(args.synergy)}_{int(args.redundancy)}"
     os.environ["EXPERIMENT_DIR"] = f"./{dataset_dir}/{exp_name}"
 args.experiment = os.environ["EXPERIMENT_DIR"]
 
@@ -1796,20 +1804,23 @@ processed_sp_valid = pickle.load(open(args.directory_explanations + "processed_s
 processed_po_valid = pickle.load(open(args.directory_explanations + "processed_po_valid.pkl", "rb"))
 
 rule_file = args.rule_file if args.rule_file else f"./{dataset_dir}/rules/rules-1000"
-synergy_dir = os.path.dirname(rule_file)
-synergy_file = os.path.join(synergy_dir, "synergy.txt")
+dependency_dir = os.path.dirname(rule_file)
+synergy_filtered_file = os.path.join(dependency_dir, "synergy_filtered.txt")
+redundancy_filtered_file = os.path.join(dependency_dir, "redundancy_filtered.txt")
 relation_ids = read_ids(f"./{dataset_dir}/relation_ids.del")
 rule_meta = parse_rule_file_metadata(rule_file, relation_ids)
-synergy_map = (
-    parse_synergy_file(
-        synergy_file,
-        rule_meta["rule_relation_by_id"],
-        min_synergy=args.min_synergy,
-        degree_alpha=args.synergy_degree_alpha,
-    )
-    if args.synergy
-    else {}
-)
+dependency_map = defaultdict(list)
+if args.synergy:
+    for relation, deps in parse_filtered_dependency_file(
+        synergy_filtered_file, rule_meta["rule_relation_by_id"], "synergy"
+    ).items():
+        dependency_map[int(relation)].extend(deps)
+if args.redundancy:
+    for relation, deps in parse_filtered_dependency_file(
+        redundancy_filtered_file, rule_meta["rule_relation_by_id"], "redundancy"
+    ).items():
+        dependency_map[int(relation)].extend(deps)
+dependency_map = dict(dependency_map)
 
 LEN_RULES = rule_meta["num_rules"]
 MAX_RULE_ID = rule_meta["max_rule_id"]
