@@ -87,11 +87,11 @@ def save(obj, folder, name=None, override=False):
     if not os.path.exists(folder):
         os.makedirs(folder)
     path_to_file = f"{folder}/{name}"
-    if exists(path_to_file):
-        print(f"Warning name {name} exists in cache, do you want to overwrite y/n?")
-        confirm = input() if not override else "y"
-        if confirm != "y":
-            return None
+    # if exists(path_to_file):
+    #     print(f"Warning name {name} exists in cache, do you want to overwrite y/n?")
+    #     confirm = input() if not override else "y"
+    #     if confirm != "y":
+    #         return None
 
     pickle.dump(obj, open(path_to_file, "wb"))
     return name
@@ -546,24 +546,21 @@ class LinearAggregator(nn.Module):
 
 
 class SurprisalAggregator(nn.Module):
+    WEIGHT_MIN = 0.0
+    WEIGHT_MAX = 7.0
+
     def init_weights(self):
         with torch.no_grad():
             torch.manual_seed(0)
             confs = RULE_CONF_TABLE_CPU[torch.tensor(self.relation_rule_ids, dtype=torch.long)].reshape(-1, 1)
             confs = confs.clamp(min=0.0, max=1 - 1e-7)
             surprisal = -torch.log(1 - confs)
-            if self.sign_constraint:
-                surprisal = torch.sqrt(torch.clamp(surprisal, min=0.0))
             self.rules.weight[: self.num_relation_rules] = surprisal
             if self.num_relation_synergy > 0:
                 synergy_init = torch.tensor(self.relation_synergy_lifts, dtype=torch.float32).reshape(-1, 1)
-                if self.sign_constraint:
-                    synergy_init = torch.sqrt(torch.clamp(synergy_init, min=0.0))
                 self.synergy.weight[: self.num_relation_synergy] = synergy_init
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            if self.sign_constraint:
-                bound = math.sqrt(bound)
             self.bias.uniform_(-bound, bound)
             self.gamma.fill_(1.0)
 
@@ -623,9 +620,8 @@ class SurprisalAggregator(nn.Module):
         local_rules = self.global_to_local[rules.long()]
         mask = local_rules == self.pad_local_tok
         rule_w = self.rules(local_rules).squeeze(dim=2)
+        rule_w = torch.clamp(rule_w, min=self.WEIGHT_MIN, max=self.WEIGHT_MAX)
         rule_w.masked_fill_(mask, 0.0)
-        if self.sign_constraint:
-            rule_w = rule_w**2
         score = rule_w.sum(dim=1, keepdim=True)
 
         if self.num_relation_synergy > 0:
@@ -642,8 +638,7 @@ class SurprisalAggregator(nn.Module):
                 pair_chunk = int(self.num_relation_synergy)
 
             synergy_w_all = self.synergy.weight[: self.num_relation_synergy, 0]
-            if self.sign_constraint:
-                synergy_w_all = synergy_w_all**2
+            synergy_w_all = torch.clamp(synergy_w_all, min=self.WEIGHT_MIN, max=self.WEIGHT_MAX)
 
             synergy_score = torch.zeros((batch_size, 1), dtype=rule_w.dtype, device=local_rules.device)
             # 仅遍历当前 batch 中“可能生效”的 synergy 对，避免全量扫描。
@@ -667,10 +662,11 @@ class SurprisalAggregator(nn.Module):
                     pair_active_chunk = active_matrix[:, a_local] & active_matrix[:, b_local]
                     w_chunk = synergy_w_active[start:end].reshape(1, -1)
                     synergy_score = synergy_score + (pair_active_chunk.float() * w_chunk).sum(dim=1, keepdim=True)
-            score = score + self.gamma * synergy_score
+            gamma_eff = torch.clamp(self.gamma, min=self.WEIGHT_MIN, max=self.WEIGHT_MAX)
+            score = score + gamma_eff * synergy_score
 
         if self.sign_constraint:
-            score = score + self.bias**2
+            score = torch.clamp(score + self.bias, min=0.0)
         else:
             score = torch.nn.functional.softplus(score + self.bias)
             # score = torch.clamp(score + self.bias, min=0.0)
@@ -747,6 +743,15 @@ class MRR:
         return (mrr, h1, h10, mrr_raw, h1_raw, h10_raw)
 
     def update(self, nnm, hps):
+        has_non_finite = False
+        for _name, p in nnm.named_parameters():
+            if not torch.isfinite(p).all():
+                has_non_finite = True
+                break
+        if has_non_finite:
+            print(f"[WARN] relation={self.relation} direction={self.direction}: non-finite params on valid eval, skip update")
+            return
+
         (v_mrr, v_h1, v_h10, v_mrr_raw, v_h1_raw, v_h10_raw) = self.calc_metrics(
             nnm, self.valid_sp_to_o, self.valid_processed, direction=self.direction, filter_test=True
         )
@@ -1531,8 +1536,10 @@ dataset_dir = os.path.join(args.data_root, args.dataset)
 args.directory_explanations = f"./{dataset_dir}/expl/"
 args.directory_preprocessed_datasets = f"./{dataset_dir}/datasets/"
 if "EXPERIMENT_DIR" not in os.environ:
-    time = datetime.now().strftime("%m%d-%H%M")
-    os.environ["EXPERIMENT_DIR"] = f"./{dataset_dir}/exp-{time}"
+    sign_bit = 1 if args.sign_constraint else 0
+    synergy_bit = 1 if args.synergy else 0
+    exp_name = f"exp{args.relation}_{args.model}_{sign_bit}_{synergy_bit}"
+    os.environ["EXPERIMENT_DIR"] = f"./{dataset_dir}/{exp_name}"
 args.experiment = os.environ["EXPERIMENT_DIR"]
 
 # Set up experiment folder

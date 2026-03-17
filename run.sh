@@ -69,10 +69,12 @@ process_dataset() {
     python process_rules.py --data_dir "$data_dir" --split test \
         --target_file "${data_dir}/test.txt" --applied_rules_file "${out_dir}/applied_rules_test.json" --save_dir "$out_dir"
 
-    python aggregation.py -d "$dataset" --relation -1 --multiprocess 3
+    python aggregation.py -d "$dataset" --relation -1 --multiprocess 2
+    python aggregation.py -d "$dataset" --relation -1 --multiprocess 2 --model SurprisalAggregator
+    python aggregation.py -d "$dataset" --relation -1 --multiprocess 1 --model SurprisalAggregator --synergy
 }
 
-for dataset in codex-m; do
+for dataset in fb15k-237 wnrr codex-m codex-l YAGO3-10 KG20C; do
     process_dataset "$dataset"
 done
 
