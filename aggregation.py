@@ -485,18 +485,37 @@ class LinearAggregator(nn.Module):
             if self.sign_constraint:
                 confs = torch.sqrt(torch.clamp(confs, min=0.0))
             self.rules.weight[: self.num_relation_rules] = confs
+            if self.num_relation_dependencies > 0:
+                if self.dependency_sign_constraint:
+                    self.dependencies.weight[: self.num_relation_dependencies].fill_(0.1)
+                else:
+                    self.dependencies.weight[: self.num_relation_dependencies].zero_()
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.rules.weight[: self.num_relation_rules].reshape(1, -1))
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             self.bias.uniform_(-bound, bound)
 
-    def __init__(self, relation, sign_constraint=False):
+    def __init__(
+        self,
+        relation,
+        sign_constraint=False,
+        relation_dependencies=None,
+        dependency_sign_constraint=False,
+    ):
         super().__init__()
         self.sign_constraint = sign_constraint
+        self.dependency_sign_constraint = dependency_sign_constraint
 
         relation_rule_ids = sorted(rule_map.get(relation, []))
         self.relation_rule_ids = np.array(relation_rule_ids, dtype=np.int64)
         self.num_relation_rules = len(relation_rule_ids)
         self.pad_local_tok = self.num_relation_rules
+
+        if relation_dependencies is None:
+            relation_dependencies = []
+        relation_dependencies = sorted(relation_dependencies, key=lambda x: (x[0], x[1], x[2]))
+        local_pairs = []
+        global_pairs_filtered = []
+        dependency_signs = []
 
         self.rules = nn.Embedding(self.num_relation_rules + 1, 1, padding_idx=self.pad_local_tok)
         self.bias = nn.Parameter(torch.zeros(1, 1))
@@ -508,6 +527,34 @@ class LinearAggregator(nn.Module):
             )
         self.register_buffer("global_to_local", global_to_local)
 
+        for a, b, dependency_type in relation_dependencies:
+            local_a = int(global_to_local[a].item())
+            local_b = int(global_to_local[b].item())
+            if local_a == self.pad_local_tok or local_b == self.pad_local_tok:
+                continue
+            local_pairs.append((local_a, local_b))
+            global_pairs_filtered.append((int(a), int(b), str(dependency_type)))
+            dependency_signs.append(1.0 if dependency_type == "synergy" else -1.0)
+
+        self.num_relation_dependencies = len(local_pairs)
+        self.num_relation_synergy = self.num_relation_dependencies
+        self.relation_dependency_pairs_global = global_pairs_filtered
+        self.relation_synergy_pairs_global = [(int(a), int(b)) for a, b, _kind in global_pairs_filtered]
+        self.pad_dependency_tok = self.num_relation_dependencies
+        self.pad_synergy_tok = self.pad_dependency_tok
+        if self.num_relation_dependencies > 0:
+            self.dependencies = nn.Embedding(self.num_relation_dependencies + 1, 1, padding_idx=self.pad_dependency_tok)
+            pair_a = torch.tensor([p[0] for p in local_pairs], dtype=torch.long)
+            pair_b = torch.tensor([p[1] for p in local_pairs], dtype=torch.long)
+            dependency_sign_t = torch.tensor(dependency_signs, dtype=torch.float32)
+        else:
+            pair_a = torch.empty((0,), dtype=torch.long)
+            pair_b = torch.empty((0,), dtype=torch.long)
+            dependency_sign_t = torch.empty((0,), dtype=torch.float32)
+        self.register_buffer("synergy_pair_a_local", pair_a)
+        self.register_buffer("synergy_pair_b_local", pair_b)
+        self.register_buffer("dependency_pair_sign", dependency_sign_t)
+
         self.init_weights()
 
     def forward(self, rules):
@@ -517,7 +564,49 @@ class LinearAggregator(nn.Module):
         local_rules.masked_fill_(mask.unsqueeze(dim=2), 0.0)
         if self.sign_constraint:
             local_rules = local_rules**2
-        logits = local_rules.sum(dim=1) + self.bias
+        logits = local_rules.sum(dim=1)
+
+        if self.num_relation_dependencies > 0:
+            batch_size = int(local_rules.shape[0])
+            active = ~mask
+            active_matrix = torch.zeros(
+                (batch_size, self.num_relation_rules), dtype=torch.bool, device=local_rules.device
+            )
+            row_idx = torch.arange(batch_size, device=local_rules.device).unsqueeze(1).expand_as(local_rules.squeeze(dim=2))
+            local_rules_flat = self.global_to_local[rules.long()]
+            active_matrix[row_idx[active], local_rules_flat[active]] = True
+
+            pair_chunk = int(getattr(args, "synergy_pair_chunk_size", 0))
+            if pair_chunk <= 0:
+                pair_chunk = int(self.num_relation_dependencies)
+
+            dependency_w_all = self.dependencies.weight[: self.num_relation_dependencies, 0]
+            if self.dependency_sign_constraint:
+                dependency_w_all = (dependency_w_all**2) * self.dependency_pair_sign
+
+            dependency_score = torch.zeros((batch_size, 1), dtype=logits.dtype, device=local_rules.device)
+            active_rules_in_batch = active_matrix.any(dim=0)
+            active_pair_mask = active_rules_in_batch[self.synergy_pair_a_local] & active_rules_in_batch[
+                self.synergy_pair_b_local
+            ]
+            active_pair_idx = torch.nonzero(active_pair_mask, as_tuple=False).reshape(-1)
+
+            if active_pair_idx.numel() > 0:
+                pair_a_active = self.synergy_pair_a_local[active_pair_idx]
+                pair_b_active = self.synergy_pair_b_local[active_pair_idx]
+                dependency_w_active = dependency_w_all[active_pair_idx]
+
+                active_pair_count = int(active_pair_idx.numel())
+                for start in range(0, active_pair_count, pair_chunk):
+                    end = min(start + pair_chunk, active_pair_count)
+                    a_local = pair_a_active[start:end]
+                    b_local = pair_b_active[start:end]
+                    pair_active_chunk = active_matrix[:, a_local] & active_matrix[:, b_local]
+                    w_chunk = dependency_w_active[start:end].reshape(1, -1)
+                    dependency_score = dependency_score + (pair_active_chunk.float() * w_chunk).sum(dim=1, keepdim=True)
+            logits = logits + dependency_score
+
+        logits = logits + self.bias
         return logits
 
 
@@ -535,7 +624,7 @@ class SurprisalAggregator(nn.Module):
             if self.num_relation_dependencies > 0:
                 # With sign constraints we square the raw parameter in forward().
                 # Initializing at exactly 0 would make the dependency gradient stay at 0 forever.
-                if self.sign_constraint:
+                if self.dependency_sign_constraint:
                     self.dependencies.weight[: self.num_relation_dependencies].fill_(0.1)
                 else:
                     self.dependencies.weight[: self.num_relation_dependencies].zero_()
@@ -543,9 +632,16 @@ class SurprisalAggregator(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             self.bias.uniform_(-bound, bound)
 
-    def __init__(self, relation, sign_constraint=False, relation_dependencies=None):
+    def __init__(
+        self,
+        relation,
+        sign_constraint=False,
+        relation_dependencies=None,
+        dependency_sign_constraint=False,
+    ):
         super().__init__()
         self.sign_constraint = sign_constraint
+        self.dependency_sign_constraint = dependency_sign_constraint
 
         relation_rule_ids = sorted(rule_map.get(relation, []))
         self.relation_rule_ids = np.array(relation_rule_ids, dtype=np.int64)
@@ -622,7 +718,7 @@ class SurprisalAggregator(nn.Module):
 
             dependency_w_all = self.dependencies.weight[: self.num_relation_dependencies, 0]
             dependency_w_all = torch.clamp(dependency_w_all, min=self.WEIGHT_MIN, max=self.WEIGHT_MAX)
-            if self.sign_constraint:
+            if self.dependency_sign_constraint:
                 dependency_w_all = (dependency_w_all**2) * self.dependency_pair_sign
 
             dependency_score = torch.zeros((batch_size, 1), dtype=rule_w.dtype, device=local_rules.device)
@@ -677,20 +773,36 @@ def calc_mrr(tail_mrr, head_mrr, attr="maximums_t"):
 
 def build_rule_only_model_for_relation(relation):
     if args.model == "LinearAggregator":
-        return LinearAggregator(relation=relation, sign_constraint=args.sign_constraint)
+        return LinearAggregator(
+            relation=relation,
+            sign_constraint=args.sign_constraint,
+            relation_dependencies=[],
+            dependency_sign_constraint=args.sign_constraint_dependency,
+        )
     if args.model == "SurprisalAggregator":
-        return SurprisalAggregator(relation=relation, sign_constraint=args.sign_constraint, relation_dependencies=[])
+        return SurprisalAggregator(
+            relation=relation,
+            sign_constraint=args.sign_constraint,
+            relation_dependencies=[],
+            dependency_sign_constraint=args.sign_constraint_dependency,
+        )
     raise ValueError(f"Unknown model: {args.model}")
 
 
 def build_dependency_model_for_relation(relation):
     if args.model == "LinearAggregator":
-        return LinearAggregator(relation=relation, sign_constraint=args.sign_constraint)
+        return LinearAggregator(
+            relation=relation,
+            sign_constraint=args.sign_constraint,
+            relation_dependencies=dependency_map.get(relation, []),
+            dependency_sign_constraint=args.sign_constraint_dependency,
+        )
     if args.model == "SurprisalAggregator":
         return SurprisalAggregator(
             relation=relation,
             sign_constraint=args.sign_constraint,
             relation_dependencies=dependency_map.get(relation, []),
+            dependency_sign_constraint=args.sign_constraint_dependency,
         )
     raise ValueError(f"Unknown model: {args.model}")
 
@@ -927,9 +1039,21 @@ def get_parser():
         "--no_sign_constraint",
         dest="sign_constraint",
         action="store_false",
-        help="Disable sign constraint. By default, sign constraint is enabled for LinearAggregator.",
+        help="Disable sign constraint for rule weights.",
     )
-    parser.set_defaults(sign_constraint=True)
+    parser.add_argument(
+        "--no_sign_constraint_dependency",
+        dest="sign_constraint_dependency",
+        action="store_false",
+        help="Disable sign constraint for dependency weights.",
+    )
+    parser.add_argument(
+        "--train_rule_in_dependency_stage",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(sign_constraint=True, sign_constraint_dependency=True)
     parser.add_argument("--relation", action="store", help="Relation to train on", default=0, type=int)
     parser.add_argument(
         "--multiprocess",
@@ -950,7 +1074,7 @@ def get_parser():
         action="store",
         default=32768,
         type=int,
-        help="Max number of dependency pairs processed per chunk in SurprisalAggregator forward; reduce to avoid CUDA OOM.",
+        help="Max number of dependency pairs processed per chunk in aggregator forward; reduce to avoid CUDA OOM.",
     )
     parser.add_argument(
         "--rule_file",
@@ -962,13 +1086,13 @@ def get_parser():
         "--synergy",
         action="store_true",
         default=False,
-        help="Load dependencies from synergy_filtered.txt for SurprisalAggregator.",
+        help="Load dependencies from synergy_filtered.txt.",
     )
     parser.add_argument(
         "--redundancy",
         action="store_true",
         default=False,
-        help="Load dependencies from redundancy_filtered.txt for SurprisalAggregator.",
+        help="Load dependencies from redundancy_filtered.txt.",
     )
     parser.add_argument(
         "--collect_train_hit_counts",
@@ -989,6 +1113,14 @@ def parse_csv_schedule(raw_value, cast_fn, name):
     except Exception as e:
         raise ValueError(f"Invalid {name}: {raw_value}") from e
     return values
+
+
+def build_dependency_stage_finetune_schedules(stage1_lr_values, stage1_eval_every_values):
+    # Stage 2 starts from the trained stage-1 checkpoint, so keep updates conservative
+    # and validate every epoch to avoid overshooting a good solution.
+    stage2_lr_values = [max(float(v) * 0.1, 1e-5) for v in stage1_lr_values]
+    stage2_eval_every_values = [1 for _ in stage1_eval_every_values]
+    return stage2_lr_values, stage2_eval_every_values
 
 
 def build_phase_lengths(max_epoch, num_phases):
@@ -1306,6 +1438,9 @@ def aggregate_single(relation):
     eval_every_values = parse_csv_schedule(args.evaluate_every, int, "evaluate_every")
     if any(v < 0 for v in eval_every_values):
         raise ValueError(f"All evaluate_every values must be >= 0, got {eval_every_values}")
+    dependency_lr_values, dependency_eval_every_values = build_dependency_stage_finetune_schedules(
+        lr_values, eval_every_values
+    )
     early_stopping_patience = int(args.early_stopping)
 
     rule_model = build_rule_only_model_for_relation(relation)
@@ -1343,10 +1478,9 @@ def aggregate_single(relation):
     test_stage_2 = stage1_result["test"]
     test_stage_3 = None
 
-    if args.model == "SurprisalAggregator" and (args.synergy or args.redundancy):
+    if (args.synergy or args.redundancy):
         dependency_model = build_dependency_model_for_relation(relation)
         copy_rule_state_from_model(stage1_result["model"], dependency_model)
-        freeze_rule_parameters_for_synergy_stage(dependency_model)
         dependency_model = dependency_model.to(args.device)
 
         dependency_pairs = list(getattr(dependency_model, "relation_dependency_pairs_global", []))
@@ -1368,8 +1502,8 @@ def aggregate_single(relation):
                 dataloader=train_dataloader,
                 loss_fn=loss_fn,
                 pos=pos,
-                lr_values=lr_values,
-                eval_every_values=eval_every_values,
+                lr_values=dependency_lr_values,
+                eval_every_values=dependency_eval_every_values,
                 max_epoch=max_epoch,
                 stage_name="dependency",
             )
@@ -1435,8 +1569,7 @@ def aggregate_single(relation):
     learned_dependency_weights = []
     dependency_weights_model = dependency_stage_result["model"] if dependency_stage_result is not None else None
     if (
-        args.model == "SurprisalAggregator"
-        and dependency_weights_model is not None
+        dependency_weights_model is not None
         and len(dependency_pairs) > 0
         and getattr(dependency_weights_model, "num_relation_dependencies", 0) > 0
     ):
@@ -1454,8 +1587,12 @@ def aggregate_single(relation):
                 str(kind),
                 round(float(o), 7),
                 round(float(t), 7),
-                round(float(((o**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint else o), 7),
-                round(float(((t**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint else t), 7),
+                round(
+                    float(((o**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint_dependency else o), 7
+                ),
+                round(
+                    float(((t**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint_dependency else t), 7
+                ),
                 int(dependency_hit_counts.get((int(a), int(b)), 0)),
             )
             for (a, b, kind), o, t in zip(
@@ -1620,27 +1757,33 @@ def _merge_metric_files(metric_files, relation_test_counts):
             m = json.load(f)
         relation = int(m["relation"])
         count = relation_test_counts.get(relation, 0)
+        test_before_stage1 = m.get("test_before_stage1", m.get("test_stage_1_rule_init", m.get("test_initial")))
+        test_after_stage1 = m.get("test_after_stage1", m.get("test_stage_2_rule_trained"))
+        # Keep summary denominators comparable across stages by carrying forward the
+        # stage-1 result for relations that never entered stage 2.
+        test_before_stage2 = m.get("test_before_stage2", m.get("test_stage_3_synergy_init")) or test_after_stage1
+        test_after_stage2 = m.get("test_after_stage2", m.get("test_stage_4_synergy_trained")) or test_before_stage2
         append_stage_row(
             "test_before_stage1",
-            m.get("test_before_stage1", m.get("test_stage_1_rule_init", m.get("test_initial"))),
+            test_before_stage1,
             relation,
             count,
         )
         append_stage_row(
             "test_after_stage1",
-            m.get("test_after_stage1", m.get("test_stage_2_rule_trained")),
+            test_after_stage1,
             relation,
             count,
         )
         append_stage_row(
             "test_before_stage2",
-            m.get("test_before_stage2", m.get("test_stage_3_synergy_init")),
+            test_before_stage2,
             relation,
             count,
         )
         append_stage_row(
             "test_after_stage2",
-            m.get("test_after_stage2", m.get("test_stage_4_synergy_trained")),
+            test_after_stage2,
             relation,
             count,
         )
@@ -1766,14 +1909,20 @@ def aggregate_multiple():
     return _finalize_relation_sweep(failed_relations, relation_test_counts, sweep_seconds)
 
 args = get_parser().parse_args()
+if hasattr(args, "train_rule_in_dependency_stage"):
+    delattr(args, "train_rule_in_dependency_stage")
 EVAL_DEVICE = torch.device(args.device)
 dataset_dir = os.path.join(args.data_root, args.dataset)
 args.directory_explanations = f"./{dataset_dir}/expl/"
 args.directory_preprocessed_datasets = f"./{dataset_dir}/datasets/"
 if "EXPERIMENT_DIR" not in os.environ:
     sign_bit = 1 if args.sign_constraint else 0
+    sign_dependency_bit = 1 if args.sign_constraint_dependency else 0
     dependency_bit = 1 if (args.synergy or args.redundancy) else 0
-    exp_name = f"exp{args.relation}_{args.model}_{sign_bit}_{int(args.synergy)}_{int(args.redundancy)}"
+    exp_name = (
+        f"exp{args.relation}_{args.model}_{sign_bit}_{sign_dependency_bit}_{dependency_bit}_"
+        f"{int(args.synergy)}_{int(args.redundancy)}"
+    )
     os.environ["EXPERIMENT_DIR"] = f"./{dataset_dir}/{exp_name}"
 args.experiment = os.environ["EXPERIMENT_DIR"]
 
