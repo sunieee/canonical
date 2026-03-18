@@ -1171,7 +1171,7 @@ def get_parser():
     parser.add_argument(
         "--dependency_chunk_size",
         action="store",
-        default=4096,
+        default=2048,
         type=int,
         help="Target dependency count for merged stage-2 blocks; also used as forward chunk size for dependency pairs.",
     )

@@ -1,0 +1,109 @@
+{
+    "relation": 17,
+    "num_test_samples": 169,
+    "num_relation_rules": 2331,
+    "num_relation_synergy": 1,
+    "num_relation_dependencies": 1,
+    "num_relation_features": 2332,
+    "train": {
+        "max_epoch": 60,
+        "epochs_trained": 24,
+        "evaluate_every": 4,
+        "early_stopping_patience_eval_rounds": 5,
+        "stage1_rule_only": {
+            "epochs_trained": 24,
+            "evaluate_every": 4,
+            "best_valid_epoch": 4,
+            "best_valid_combined_raw": 0.1486111581325531
+        },
+        "stage2_dependency_only": {
+            "epochs_trained": 5,
+            "evaluate_every": 1,
+            "best_valid_epoch": 0,
+            "best_valid_combined_raw": 0.1486111581325531,
+            "num_blocks": 1,
+            "accepted_blocks": 0
+        }
+    },
+    "time_seconds": {
+        "total": 10.095695252064615,
+        "load_dataloaders": 1.5604149769060314,
+        "train": 2.1210724348202348,
+        "eval": 4.547685789875686,
+        "other": 1.8665220504626632
+    },
+    "best_valid_stage1": {
+        "mrr": 0.1527872197329998,
+        "mrr_raw": 0.1486111581325531,
+        "head_mrr": 0.0370059534907341,
+        "tail_mrr": 0.2685684859752655,
+        "head_mrr_raw": 0.03067570924758911,
+        "tail_mrr_raw": 0.2665466070175171,
+        "combined_raw": 0.1486111581325531,
+        "epoch": 4
+    },
+    "best_valid_stage2": {
+        "mrr": 0.1527872197329998,
+        "mrr_raw": 0.1486111581325531,
+        "head_mrr": 0.0370059534907341,
+        "tail_mrr": 0.2685684859752655,
+        "head_mrr_raw": 0.03067570924758911,
+        "tail_mrr_raw": 0.2665466070175171,
+        "combined_raw": 0.1486111581325531,
+        "epoch": 0
+    },
+    "model_selection": {
+        "selected_stage": "rule_only",
+        "dependency_stage_attempted": true,
+        "dependency_stage_accepted": false,
+        "rule_best_valid_combined_raw": 0.1486111581325531,
+        "dependency_best_valid_combined_raw": 0.1486111581325531,
+        "reason": "rejected dependency stage because its best valid combined raw did not exceed the rule-only stage"
+    },
+    "params": {
+        "bias": {
+            "original": -0.00015506945783272386,
+            "trained": -1.45592200756073
+        }
+    },
+    "test_before_stage1": {
+        "mrr": 0.13844204880297184,
+        "h1": 0.07396449707448483,
+        "h10": 0.2781065050512552,
+        "mrr_raw": 0.1441621957346797,
+        "h1_raw": 0.07692307699471712,
+        "h10_raw": 0.26035503577440977
+    },
+    "test_after_stage1": {
+        "mrr": 0.1430877298116684,
+        "h1": 0.08579881861805916,
+        "h10": 0.2692307773977518,
+        "mrr_raw": 0.1397238913923502,
+        "h1_raw": 0.07988165784627199,
+        "h10_raw": 0.2662721974775195
+    },
+    "test_before_stage2": {
+        "mrr": 0.1430877298116684,
+        "h1": 0.08579881861805916,
+        "h10": 0.2692307773977518,
+        "mrr_raw": 0.1397238913923502,
+        "h1_raw": 0.07988165784627199,
+        "h10_raw": 0.2662721974775195
+    },
+    "test_after_stage2": {
+        "mrr": 0.1430877298116684,
+        "h1": 0.08579881861805916,
+        "h10": 0.2692307773977518,
+        "mrr_raw": 0.1397238913923502,
+        "h1_raw": 0.07988165784627199,
+        "h10_raw": 0.2662721974775195
+    },
+    "test": {
+        "mrr": 0.1430877298116684,
+        "h1": 0.08579881861805916,
+        "h10": 0.2692307773977518,
+        "mrr_raw": 0.1397238913923502,
+        "h1_raw": 0.07988165784627199,
+        "h10_raw": 0.2662721974775195
+    }
+}

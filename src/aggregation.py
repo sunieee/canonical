@@ -1171,7 +1171,7 @@ def get_parser():
     parser.add_argument(
         "--dependency_chunk_size",
         action="store",
-        default=4096,
+        default=2048,
         type=int,
         help="Target dependency count for merged stage-2 blocks; also used as forward chunk size for dependency pairs.",
     )
@@ -1580,12 +1580,8 @@ def run_dependency_blocks_stage(
     accepted_blocks = 0
 
     blocks = build_dependency_blocks(model, train_split, int(getattr(args, "dependency_chunk_size", 2048)))
-    use_full_dataloader_for_all_blocks = len(blocks) == 1
     for block_idx, block in enumerate(blocks):
-        if use_full_dataloader_for_all_blocks:
-            block_loader = base_dataloader
-        else:
-            block_loader = build_block_dataloader(base_dataloader, block["rule_ids"])
+        block_loader = build_block_dataloader(base_dataloader, block["rule_ids"])
         if block_loader is None or len(block_loader) == 0:
             continue
 
@@ -1718,8 +1714,7 @@ def aggregate_single(relation):
     if (args.synergy or args.redundancy):
         dependency_model = build_dependency_model_for_relation(relation)
         copy_rule_state_from_model(stage1_result["model"], dependency_model)
-        if not getattr(args, "train_rule_in_dependency_stage", False):
-            freeze_rule_parameters_for_synergy_stage(dependency_model)
+        freeze_rule_parameters_for_synergy_stage(dependency_model)
         dependency_model = dependency_model.to(args.device)
 
         dependency_pairs = list(getattr(dependency_model, "relation_dependency_pairs_global", []))
@@ -2150,6 +2145,8 @@ def aggregate_multiple():
     return _finalize_relation_sweep(failed_relations, relation_test_counts, sweep_seconds)
 
 args = get_parser().parse_args()
+if hasattr(args, "train_rule_in_dependency_stage"):
+    delattr(args, "train_rule_in_dependency_stage")
 EVAL_DEVICE = torch.device(args.device)
 dataset_dir = os.path.join(args.data_root, args.dataset)
 args.directory_explanations = f"./{dataset_dir}/expl/"
