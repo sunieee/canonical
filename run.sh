@@ -57,17 +57,13 @@ process_dataset() {
 
     mkdir -p "$out_dir"
 
-    apply_pyclause_on_split train "$data_dir" "$out_dir" "$rules_file"
-    apply_pyclause_on_split valid "$data_dir" "$out_dir" "$rules_file"
-    apply_pyclause_on_split test "$data_dir" "$out_dir" "$rules_file"
+    for split in train valid test; do
+        apply_pyclause_on_split "$split" "$data_dir" "$out_dir" "$rules_file"
+        python process_rules.py --data_dir "$data_dir" --split "$split" --target_file "${data_dir}/${split}.txt" \
+            --applied_rules_file "${out_dir}/applied_rules_${split}.json" --save_dir "$out_dir"
+    done
 
     python create_datasets.py -d "$dataset" --applied_rules "${out_dir}/applied_rules_train.json"
-
-    python process_rules.py --data_dir "$data_dir" --split valid \
-        --target_file "${data_dir}/valid.txt" --applied_rules_file "${out_dir}/applied_rules_valid.json" --save_dir "$out_dir"
-
-    python process_rules.py --data_dir "$data_dir" --split test \
-        --target_file "${data_dir}/test.txt" --applied_rules_file "${out_dir}/applied_rules_test.json" --save_dir "$out_dir"
 
     python aggregation.py -d "$dataset" --relation -1 --multiprocess 2
     python aggregation.py -d "$dataset" --relation -1 --multiprocess 2 --model SurprisalAggregator
@@ -77,4 +73,3 @@ process_dataset() {
 for dataset in fb15k-237 wnrr codex-m codex-l YAGO3-10 KG20C; do
     process_dataset "$dataset"
 done
-

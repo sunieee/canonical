@@ -1129,7 +1129,7 @@ def get_parser():
     parser.add_argument(
         "--early_stopping",
         action="store",
-        default=5,
+        default=3,
         type=int,
         help="Stop if valid metric does not improve for X consecutive evaluations. -1 disables.",
     )
@@ -1203,8 +1203,14 @@ def get_parser():
     parser.add_argument(
         "--collect_train_hit_counts",
         action="store_true",
-        default=False,
+        default=True,
         help="Collect per-rule/per-dependency train hit counts for analysis CSVs (can be slow).",
+    )
+    parser.add_argument(
+        "--no_collect_train_hit_counts",
+        dest="collect_train_hit_counts",
+        action="store_false",
+        help="Disable per-rule/per-dependency train hit count collection.",
     )
 
     return parser
@@ -1293,6 +1299,38 @@ def freeze_rule_parameters_for_synergy_stage(model):
         model.rules.weight.requires_grad_(False)
     if hasattr(model, "bias"):
         model.bias.requires_grad_(False)
+
+
+def build_dependency_weight_rows(model, dependency_pairs, initial_dependency_weights, dependency_hit_counts):
+    if (
+        model is None
+        or len(dependency_pairs) == 0
+        or not hasattr(model, "dependencies")
+        or getattr(model, "num_relation_dependencies", 0) <= 0
+    ):
+        return []
+
+    with torch.no_grad():
+        trained_dependency_weights = (
+            model.dependencies.weight[: model.num_relation_dependencies, 0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    return [
+        (
+            int(a),
+            int(b),
+            str(kind),
+            round(float(o), 7),
+            round(float(t), 7),
+            round(float(((o**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint_dependency else o), 7),
+            round(float(((t**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint_dependency else t), 7),
+            int(dependency_hit_counts.get((int(a), int(b)), 0)),
+        )
+        for (a, b, kind), o, t in zip(dependency_pairs, initial_dependency_weights.tolist(), trained_dependency_weights.tolist())
+    ]
 
 
 def build_optimizer_for_model(model, lr):
@@ -1807,39 +1845,24 @@ def aggregate_single(relation):
             )
             )
 
-    learned_dependency_weights = []
-    dependency_weights_model = dependency_stage_result["model"] if dependency_stage_result is not None else None
-    if (
-        dependency_weights_model is not None
-        and len(dependency_pairs) > 0
-        and getattr(dependency_weights_model, "num_relation_dependencies", 0) > 0
-    ):
-        with torch.no_grad():
-            trained_dependency_weights = (
-                dependency_weights_model.dependencies.weight[: dependency_weights_model.num_relation_dependencies, 0]
-                .detach()
-                .cpu()
-                .numpy()
-            )
-        learned_dependency_weights = [
-            (
-                int(a),
-                int(b),
-                str(kind),
-                round(float(o), 7),
-                round(float(t), 7),
-                round(
-                    float(((o**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint_dependency else o), 7
-                ),
-                round(
-                    float(((t**2) * (1.0 if kind == "synergy" else -1.0)) if args.sign_constraint_dependency else t), 7
-                ),
-                int(dependency_hit_counts.get((int(a), int(b)), 0)),
-            )
-            for (a, b, kind), o, t in zip(
-                dependency_pairs, initial_dependency_weights.tolist(), trained_dependency_weights.tolist()
-            )
-        ]
+    learned_dependency_weights_trial = []
+    dependency_weights_trial_model = dependency_stage_result["model"] if dependency_stage_result is not None else None
+    if dependency_weights_trial_model is not None:
+        learned_dependency_weights_trial = build_dependency_weight_rows(
+            dependency_weights_trial_model,
+            dependency_pairs,
+            initial_dependency_weights,
+            dependency_hit_counts,
+        )
+
+    learned_dependency_weights_final = []
+    if dependency_stage_result is not None and final_result is dependency_stage_result:
+        learned_dependency_weights_final = build_dependency_weight_rows(
+            final_result["model"],
+            dependency_pairs,
+            initial_dependency_weights,
+            dependency_hit_counts,
+        )
 
     with torch.no_grad():
         trained_bias_value = float(nnm.bias.detach().reshape(-1)[0].cpu().item()) if hasattr(nnm, "bias") else None
@@ -1923,8 +1946,8 @@ def aggregate_single(relation):
             writer.writerow(["ruleID", "original", "trained", "train_hit_count"])
             writer.writerows(learned_weights)
 
-        if len(learned_dependency_weights) > 0:
-            with open(f"{args.experiment}/dependency-{relation}.csv", "w", newline="") as f:
+        if len(learned_dependency_weights_trial) > 0:
+            with open(f"{args.experiment}/dependency-trial-{relation}.csv", "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(
                     [
@@ -1938,7 +1961,24 @@ def aggregate_single(relation):
                         "train_hit_count",
                     ]
                 )
-                writer.writerows(learned_dependency_weights)
+                writer.writerows(learned_dependency_weights_trial)
+
+        if len(learned_dependency_weights_final) > 0:
+            with open(f"{args.experiment}/dependency-final-{relation}.csv", "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "rule1ID",
+                        "rule2ID",
+                        "type",
+                        "raw_original",
+                        "raw_trained",
+                        "effective_original",
+                        "effective_trained",
+                        "train_hit_count",
+                    ]
+                )
+                writer.writerows(learned_dependency_weights_final)
 
     # 显式释放 relation 级别对象，尽量降低长跑时显存峰值。
     del train_dataloader, dataloader, train_split
