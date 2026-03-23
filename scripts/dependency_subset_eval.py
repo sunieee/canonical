@@ -17,14 +17,16 @@ def load_relation_labels(dataset_dir):
     return labels
 
 
-def compute_relation_shape_stats(dataset_dir):
+def compute_relation_shape_stats(dataset_dir, splits=None):
+    if splits is None:
+        splits = ["train.del"]
     sp = defaultdict(set)
     po = defaultdict(set)
     triples_by_rel = Counter()
     subj_by_rel = defaultdict(set)
     obj_by_rel = defaultdict(set)
 
-    for split in ["train.del", "valid.del", "test.del"]:
+    for split in splits:
         with open(os.path.join(dataset_dir, split), "r", encoding="utf-8") as f:
             for line in f:
                 s, p, o = map(int, line.strip().split("\t"))
@@ -101,32 +103,62 @@ def summarize_subset(df, name):
         "rule_stage_raw": rule_raw,
         "final_raw": final_raw,
         "gain_vs_stage1": final_raw - rule_raw,
+        "relative_gain_vs_stage1": (final_raw - rule_raw) / rule_raw if rule_raw else None,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute dependency-oriented subset evaluation and relation structure stats.")
-    parser.add_argument("--dataset", default="codex-m")
+    parser = argparse.ArgumentParser(description="Compute fair dependency-oriented subset evaluation from static relation features.")
+    parser.add_argument("-d", "--dataset", default="codex-m")
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--experiment-dir", required=True)
-    parser.add_argument("--valid-gain-threshold", type=float, default=0.002)
+    parser.add_argument("--shape-splits", nargs="+", default=["train.del"], help="Splits used to compute relation shape features.")
+    parser.add_argument("--subset-min-train", type=int, default=0)
+    parser.add_argument("--subset-min-objects", type=int, default=100)
+    parser.add_argument("--subset-min-avg-tails", type=float, default=1.1)
+    parser.add_argument("--subset-max-avg-tails", type=float, default=1.8)
+    parser.add_argument("--emit-strict-subset", action="store_true")
+    parser.add_argument("--strict-min-train", type=int, default=2000)
     args = parser.parse_args()
 
     dataset_dir = os.path.join(args.data_root, args.dataset)
     relation_labels = load_relation_labels(dataset_dir)
-    shape_df = compute_relation_shape_stats(dataset_dir)
+    shape_df = compute_relation_shape_stats(dataset_dir, splits=args.shape_splits)
     metrics_df = load_experiment_metrics(args.experiment_dir, relation_labels)
     merged = metrics_df.merge(shape_df, on="relation", how="left")
 
+    train_only_subset = merged[
+        (merged["num_triples"] >= int(args.subset_min_train))
+        & (merged["num_objects"] >= int(args.subset_min_objects))
+        & (merged["avg_tails_per_sp"] >= float(args.subset_min_avg_tails))
+        & (merged["avg_tails_per_sp"] <= float(args.subset_max_avg_tails))
+    ]
+
     subsets = {
         "all_relations": merged,
-        "dep_accepted": merged[merged["dep_accepted"] == True],
-        "dep_accepted_gain_gt_thresh": merged[
-            (merged["dep_accepted"] == True) & (merged["valid_gain"] > float(args.valid_gain_threshold))
-        ],
+        "dependency_friendly_train_only": train_only_subset,
     }
+    if args.emit_strict_subset:
+        subsets["dependency_friendly_train_only_strict"] = train_only_subset[
+            train_only_subset["num_triples"] >= int(args.strict_min_train)
+        ]
 
     print("## Subset Evaluation")
+    print(
+        json.dumps(
+            {
+                "shape_splits": args.shape_splits,
+                "dependency_friendly_rule": {
+                    "min_train": int(args.subset_min_train),
+                    "min_objects": int(args.subset_min_objects),
+                    "min_avg_tails_per_sp": float(args.subset_min_avg_tails),
+                    "max_avg_tails_per_sp": float(args.subset_max_avg_tails),
+                },
+                "strict_min_train": int(args.strict_min_train) if args.emit_strict_subset else None,
+            },
+            ensure_ascii=False,
+        )
+    )
     for name, df in subsets.items():
         summary = summarize_subset(df, name)
         if summary is None:
@@ -154,15 +186,14 @@ def main():
         print(f"[{name}]")
         print(med.to_string())
 
-    print("\n## Accepted Relations")
-    accepted = merged[merged["dep_accepted"] == True].copy()
-    if not accepted.empty:
+    print("\n## Dependency-Friendly Relations")
+    dep_subset = subsets["dependency_friendly_train_only"].copy()
+    if not dep_subset.empty:
         print(
-            accepted[
+            dep_subset[
                 [
                     "relation",
                     "rel_name",
-                    "valid_gain",
                     "test_gain_vs_stage1",
                     "rule_best_valid_raw",
                     "final_test_raw",
@@ -174,7 +205,7 @@ def main():
                     "dep_per_rule",
                 ]
             ]
-            .sort_values("valid_gain", ascending=False)
+            .sort_values("test_gain_vs_stage1", ascending=False)
             .to_string(index=False)
         )
 
