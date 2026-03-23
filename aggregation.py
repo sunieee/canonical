@@ -1599,76 +1599,35 @@ def run_training_stage(relation, model, model_builder, dataloader, loss_fn, pos,
     }
 
 
-def run_dependency_blocks_stage(
+def run_dependency_stage(
     relation,
     model,
     model_builder,
-    base_dataloader,
-    train_split,
+    dataloader,
     loss_fn,
     pos,
     lr_values,
     eval_every_values,
     max_epoch,
 ):
-    current_result = evaluate_current_stage_result(relation, model, model_builder, evaluate_every=eval_every_values[0])
-    total_epochs_trained = 0
-    total_train_seconds = 0.0
-    total_eval_seconds = float(current_result["eval_seconds"])
-    accepted_blocks = 0
+    if dataloader is None or len(dataloader) == 0:
+        raise ValueError(f"Dependency stage received empty dataloader for relation {relation}")
 
-    blocks = build_dependency_blocks(model, train_split, int(getattr(args, "dependency_chunk_size", 2048)))
-    use_full_dataloader_for_all_blocks = len(blocks) == 1
-    for block_idx, block in enumerate(blocks):
-        if use_full_dataloader_for_all_blocks:
-            block_loader = base_dataloader
-        else:
-            block_loader = build_block_dataloader(base_dataloader, block["rule_ids"])
-        if block_loader is None or len(block_loader) == 0:
-            continue
+    if hasattr(model, "trainable_dependency_grad_mask"):
+        model.trainable_dependency_grad_mask = None
 
-        dependency_backup = None
-        if getattr(model, "num_relation_dependencies", 0) > 0:
-            with torch.no_grad():
-                dependency_backup = model.dependencies.weight.detach().cpu().clone()
-                grad_mask = torch.zeros((model.num_relation_dependencies + 1,), dtype=torch.float32, device=args.device)
-                grad_mask[torch.tensor(block["pair_indices"], dtype=torch.long, device=args.device)] = 1.0
-                model.trainable_dependency_grad_mask = grad_mask
-
-        block_result = run_training_stage(
-            relation=relation,
-            model=model,
-            model_builder=model_builder,
-            dataloader=block_loader,
-            loss_fn=loss_fn,
-            pos=pos,
-            lr_values=lr_values,
-            eval_every_values=eval_every_values,
-            max_epoch=max_epoch,
-            stage_name=f"dependency-block-{block_idx}",
-        )
-
-        total_epochs_trained += int(block_result["epochs_trained"])
-        total_train_seconds += float(block_result["train_seconds"])
-        total_eval_seconds += float(block_result["eval_seconds"])
-
-        if float(block_result["best_valid_combined_raw"]) > float(current_result["best_valid_combined_raw"]):
-            current_result = block_result
-            accepted_blocks += 1
-        elif dependency_backup is not None:
-            with torch.no_grad():
-                model.dependencies.weight.copy_(dependency_backup.to(model.dependencies.weight.device))
-
-        if hasattr(model, "trainable_dependency_grad_mask"):
-            model.trainable_dependency_grad_mask = None
-
-    current_result["epochs_trained"] = int(total_epochs_trained)
-    current_result["train_seconds"] = float(total_train_seconds)
-    current_result["eval_seconds"] = float(total_eval_seconds)
-    current_result["evaluate_every"] = int(eval_every_values[0])
-    current_result["accepted_blocks"] = int(accepted_blocks)
-    current_result["num_blocks"] = int(len(blocks))
-    return current_result
+    return run_training_stage(
+        relation=relation,
+        model=model,
+        model_builder=model_builder,
+        dataloader=dataloader,
+        loss_fn=loss_fn,
+        pos=pos,
+        lr_values=lr_values,
+        eval_every_values=eval_every_values,
+        max_epoch=max_epoch,
+        stage_name="dependency",
+    )
 
 
 def aggregate_single(relation):
@@ -1772,12 +1731,11 @@ def aggregate_single(relation):
                 )
             test_stage_3 = evaluate_model_on_test(relation, dependency_model, build_dependency_model_for_relation)
 
-            dependency_stage_result = run_dependency_blocks_stage(
+            dependency_stage_result = run_dependency_stage(
                 relation=relation,
                 model=dependency_model,
                 model_builder=build_dependency_model_for_relation,
-                base_dataloader=train_dataloader,
-                train_split=train_split,
+                dataloader=train_dataloader,
                 loss_fn=loss_fn,
                 pos=pos,
                 lr_values=dependency_lr_values,
@@ -1789,8 +1747,6 @@ def aggregate_single(relation):
                 "evaluate_every": int(dependency_stage_result["evaluate_every"]),
                 "best_valid_epoch": int(dependency_stage_result["best_valid_epoch"]),
                 "best_valid_combined_raw": float(dependency_stage_result["best_valid_combined_raw"]),
-                "num_blocks": int(dependency_stage_result.get("num_blocks", 0)),
-                "accepted_blocks": int(dependency_stage_result.get("accepted_blocks", 0)),
             }
 
             rule_best_valid_combined_raw = float(stage1_result["best_valid_combined_raw"])

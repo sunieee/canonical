@@ -73,3 +73,8 @@ process_dataset() {
 for dataset in fb15k-237 wnrr codex-m codex-l YAGO3-10 KG20C; do
     process_dataset "$dataset"
 done
+
+
+python residual_dependency_ranker.py -d codex-m --min_valid 3 --min_abs_score 0.003 --support_smoothing 20 --top_k_per_relation 4096
+python aggregation.py -d codex-m --relation -1 --multiprocess 3 --synergy --redundancy --no_sign_constraint_dependency --train_rule_in_dependency_stage
+python scripts/dependency_subset_eval.py --dataset codex-m --experiment-dir data/codex-m/exp-1_LinearAggregator_1_0_1_1_1

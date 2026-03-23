@@ -690,7 +690,7 @@ def main():
     parser.add_argument("--rule_file", default="")
     parser.add_argument("--synergy_file", default="")
     parser.add_argument("--redundancy_file", default="")
-    parser.add_argument("--min_valid", type=int, default=5)
+    parser.add_argument("--min_valid", type=int, default=3)
     parser.add_argument("--min_abs_lift", type=float, default=0.01)
     parser.add_argument(
         "--min_abs_score",
